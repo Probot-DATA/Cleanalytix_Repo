@@ -1,0 +1,16 @@
+dataset_name,column_name,rule_ids,inferred_type,issue_names,recommended_fix_order
+adult,age,[3],numeric,['Outliers'],[4]
+adult,workclass,"[4, 5]",categorical,"['Whitespace Issues', 'Rare Categories']","[2, 5]"
+adult,fnlwgt,"[3, 9]",numeric,"['Outliers', 'High Skewness']","[4, 6]"
+adult,education,"[4, 5]",categorical,"['Whitespace Issues', 'Rare Categories']","[2, 5]"
+adult,education-num,[3],numeric,['Outliers'],[4]
+adult,marital-status,"[4, 5]",categorical,"['Whitespace Issues', 'Rare Categories']","[2, 5]"
+adult,occupation,"[4, 5]",categorical,"['Whitespace Issues', 'Rare Categories']","[2, 5]"
+adult,relationship,"[4, 5]",categorical,"['Whitespace Issues', 'Rare Categories']","[2, 5]"
+adult,race,"[4, 5]",categorical,"['Whitespace Issues', 'Rare Categories']","[2, 5]"
+adult,sex,[4],categorical,['Whitespace Issues'],[2]
+adult,capital-gain,[9],numeric,['High Skewness'],[6]
+adult,capital-loss,[9],numeric,['High Skewness'],[6]
+adult,hours-per-week,[3],numeric,['Outliers'],[4]
+adult,native-country,"[4, 5]",categorical,"['Whitespace Issues', 'Rare Categories']","[2, 5]"
+adult,<=50k,[4],categorical,['Whitespace Issues'],[2]

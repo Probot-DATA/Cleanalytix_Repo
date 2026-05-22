@@ -1,0 +1,39 @@
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Validation data and generated outputs
+validation/datasets/**
+!validation/datasets/
+!validation/datasets/README.md
+!validation/datasets/adult/
+!validation/datasets/adult/.gitkeep
+!validation/datasets/customer_churn/
+!validation/datasets/customer_churn/.gitkeep
+!validation/datasets/UCI_credit_card/
+!validation/datasets/UCI_credit_card/.gitkeep
+!validation/datasets/yellow_trip_data/
+!validation/datasets/yellow_trip_data/.gitkeep
+!validation/datasets/CC_GENERAL/
+!validation/datasets/CC_GENERAL/.gitkeep
+# Optional local test output scratch space
+tests/outputs/*
+!tests/outputs/.gitkeep

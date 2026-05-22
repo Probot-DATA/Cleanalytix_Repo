@@ -1,0 +1,6 @@
+age,name,city,signup_date,income,is_active
+25, Alice,NY,2024-01-01,50000,True
+,Bob ,NY,2024-01-02,52000,False
+130,Bob,LA,2024-01-03,999999,True
+40,,SF,2024-01-03,48000,True
+40,,SF,2024-01-03,48000,True

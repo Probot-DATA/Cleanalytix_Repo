@@ -1,0 +1,19 @@
+dataset_name,column_name,rule_ids,inferred_type,issue_names,recommended_fix_order
+CC_General,CUST_ID,[5],categorical,['Rare Categories'],[5]
+CC_General,BALANCE,"[3, 9]",numeric,"['Outliers', 'High Skewness']","[4, 6]"
+CC_General,BALANCE_FREQUENCY,[9],numeric,['High Skewness'],[6]
+CC_General,PURCHASES,"[3, 9]",numeric,"['Outliers', 'High Skewness']","[4, 6]"
+CC_General,ONEOFF_PURCHASES,"[3, 9]",numeric,"['Outliers', 'High Skewness']","[4, 6]"
+CC_General,INSTALLMENTS_PURCHASES,"[3, 9]",numeric,"['Outliers', 'High Skewness']","[4, 6]"
+CC_General,CASH_ADVANCE,[9],numeric,['High Skewness'],[6]
+CC_General,PURCHASES_FREQUENCY,[10],numeric,['No Issues Detected'],[100]
+CC_General,ONEOFF_PURCHASES_FREQUENCY,"[3, 9]",numeric,"['Outliers', 'High Skewness']","[4, 6]"
+CC_General,PURCHASES_INSTALLMENTS_FREQUENCY,[10],numeric,['No Issues Detected'],[100]
+CC_General,CASH_ADVANCE_FREQUENCY,[9],numeric,['High Skewness'],[6]
+CC_General,CASH_ADVANCE_TRX,[9],numeric,['High Skewness'],[6]
+CC_General,PURCHASES_TRX,"[3, 9]",numeric,"['Outliers', 'High Skewness']","[4, 6]"
+CC_General,CREDIT_LIMIT,"[2, 3, 9]",numeric,"['Missing Values', 'Outliers', 'High Skewness']","[3, 4, 6]"
+CC_General,PAYMENTS,"[3, 9]",numeric,"['Outliers', 'High Skewness']","[4, 6]"
+CC_General,MINIMUM_PAYMENTS,"[2, 3, 9]",numeric,"['Missing Values', 'Outliers', 'High Skewness']","[3, 4, 6]"
+CC_General,PRC_FULL_PAYMENT,[9],numeric,['High Skewness'],[6]
+CC_General,TENURE,[9],numeric,['High Skewness'],[6]

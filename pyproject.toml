@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=65.5.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cleanalytix"
+version = "0.1.0"
+description = "Cleanalytix is a modular Python library for profiling, scoring, and cleaning tabular datasets."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Probot-DATA contributors" }
+]
+keywords = [
+    "data quality",
+    "data cleaning",
+    "data profiling",
+    "EDA",
+    "machine learning",
+    "pandas",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "pandas>=1.5.0",
+    "numpy>=1.23.0",
+    "scikit-learn>=1.1.0",
+    "nltk>=3.8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Probot-DATA/Cleanalytix_Repo"
+Repository = "https://github.com/Probot-DATA/Cleanalytix_Repo"
+Issues = "https://github.com/Probot-DATA/Cleanalytix_Repo/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cleanalytix*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

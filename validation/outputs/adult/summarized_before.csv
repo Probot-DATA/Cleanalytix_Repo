@@ -1,0 +1,2 @@
+dataset_name,avg_missing_percent,avg_duplicate_percent,total_outliers,total_whitespace_issues
+adult,0.0,0.05937512796363785,1827.0,439578.0
