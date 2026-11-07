@@ -9,11 +9,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 - Unified primary analysis API: `cleanalytix.analyze(df, ...) -> CleanalytixResult`.
+- 10-Domain Comprehensive Analytical Output System: dataset profiling, column profiling, metric transparency, statistical intelligence, relationship analysis, temporal dynamics, baseline drift analysis, anomaly diagnostics, structured recommendations, and scoring transparency.
+- Standardized 44-metric `MetricRegistry` catalog with comprehensive domain taxonomy, calculation methods, units, DQ dimensions, scoring flags, and discovery aliases.
+- Tabular multi-view export via `CleanalytixResult.to_dataframe(view=...)` supporting all analytical domains.
 - Authoritative 6-dimension data quality scoring framework: Completeness (0.20), Validity (0.20), Uniqueness (0.15), Consistency (0.15), Timeliness (0.15), and Stability (0.15).
 - Strict dimension weight validation, custom metric weight configuration, and automatic applicability-aware normalization.
 - Dedicated `cleanalytix.metrics` subpackage: completeness, continuous/categorical distribution profiling, robust statistical estimation (Bessel's correction), drift detection (continuous/discrete KL, JS, PSI, Wasserstein, KS), relationship analysis (correlation, Cramér's V, mutual information), candidate primary key discovery, and temporal metrics.
 - Structured advisory recommendations (`InsightItem`) with severity levels (Critical, Warning, Info, Optimization).
-- Comprehensive regression and mathematical validation test suite (43 tests).
+- Comprehensive regression, mathematical validation, and analytical domain test suite (61 tests, 100% passing).
 
 ### Changed
 - Strictly non-mutating architecture: all public functions treat input DataFrames as immutable.

@@ -35,6 +35,13 @@ from cleanalytix.types import (
     Thresholds,
     MetricWeights,
 )
+from cleanalytix.registry import (
+    METRIC_CATALOG,
+    MetricDefinition,
+    MetricDomain,
+    MetricScope,
+    MetricValueStatus,
+)
 from cleanalytix.metrics.temporal import compute_temporal_metrics
 from cleanalytix.metrics.uniqueness import (
     compute_identifier_uniqueness,
@@ -431,13 +438,29 @@ def score_dataset(
     meta_df: pd.DataFrame,
     config: Optional[CleanalytixConfig] = None,
     has_baseline: bool = False,
-) -> Tuple[float, Dict[str, DimensionScore], Dict[str, float]]:
+    return_details: bool = False,
+) -> Any:
     """Compute overall quality score, 6 dimension scores, and column-level scores.
 
     Applies dynamic applicability re-weighting so that non-applicable dimensions
     (such as Stability when no baseline is present, or Timeliness when no datetime
     columns exist) are excluded from scoring, with their weight proportionally
     distributed among applicable dimensions.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Dataset to analyze (read-only).
+    meta_df : pd.DataFrame
+        Metadata table returned by generate_meta.
+    config : CleanalytixConfig, optional
+        Custom thresholds, weights, and rules.
+    has_baseline : bool, default False
+        Whether baseline dataset is present for Stability/drift scoring.
+    return_details : bool, default False
+        If True, returns an extended tuple with scoring_matrix, dimension_summary,
+        metric_inventory, and scoring_audit_trail. If False (default), returns the
+        backward-compatible 3-element tuple (overall_score, dimension_scores, final_col_scores).
     """
     if config is None:
         config = CleanalytixConfig()
@@ -462,9 +485,12 @@ def score_dataset(
             )
             for dim in QualityDimension
         }
+        if return_details:
+            return 0.0, empty_dims, {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "Empty dataset"
         return 0.0, empty_dims, {}
 
     col_scores_collector: Dict[str, List[Tuple[float, float]]] = {col: [] for col in df.columns}
+    per_col_subscores: Dict[str, Dict[str, float]] = {col: {} for col in df.columns}
 
     # =========================================================================
     # 1. COMPLETENESS DIMENSION (cell completeness + row completeness)
@@ -488,6 +514,7 @@ def score_dataset(
         )
         comp_col_scores.append(m_score)
         col_scores_collector[col].append((m_score, 1.0))
+        per_col_subscores[col]["completeness_score"] = round(m_score * 100.0, 2)
 
     avg_cell_missing_pct = (total_missing_cells / total_cells) * 100.0 if total_cells > 0 else 0.0
     cell_comp_score = calculate_metric_score(
@@ -547,6 +574,11 @@ def score_dataset(
         val_metric_scores = []
         val_metric_weights = []
 
+        t_score_val = np.nan
+        w_score_val = np.nan
+        r_score_val = np.nan
+        o_score_val = np.nan
+
         # Type errors
         type_err = row.get("type_errors", 0)
         if pd.notna(type_err):
@@ -556,6 +588,7 @@ def score_dataset(
             )
             val_metric_scores.append(t_score)
             val_metric_weights.append(w_v_type)
+            t_score_val = round(t_score * 100.0, 2)
 
         # Whitespace
         if role in {"categorical", "free_text", "identifier"}:
@@ -567,6 +600,7 @@ def score_dataset(
                 )
                 val_metric_scores.append(w_score)
                 val_metric_weights.append(w_v_ws)
+                w_score_val = round(w_score * 100.0, 2)
 
         # Rules
         rule_err = row.get("rule_errors", 0)
@@ -577,6 +611,7 @@ def score_dataset(
             )
             val_metric_scores.append(r_score)
             val_metric_weights.append(w_v_rule)
+            r_score_val = round(r_score * 100.0, 2)
 
         # Outlier plausibility (continuous / discrete numeric columns)
         if role in {"continuous", "discrete"}:
@@ -589,12 +624,21 @@ def score_dataset(
                 )
                 val_metric_scores.append(o_score)
                 val_metric_weights.append(w_v_out)
+                o_score_val = round(o_score * 100.0, 2)
 
         if val_metric_scores:
             sub_w_tot = sum(val_metric_weights)
             col_val_score = sum(s * (w / sub_w_tot) for s, w in zip(val_metric_scores, val_metric_weights))
             validity_column_scores.append(col_val_score)
             col_scores_collector[col].append((col_val_score, 1.0))
+            per_col_subscores[col]["validity_score"] = round(col_val_score * 100.0, 2)
+        else:
+            per_col_subscores[col]["validity_score"] = 100.0
+
+        per_col_subscores[col]["type_score"] = t_score_val
+        per_col_subscores[col]["whitespace_score"] = w_score_val
+        per_col_subscores[col]["rule_score"] = r_score_val
+        per_col_subscores[col]["outlier_score"] = o_score_val
 
     validity_score = float(np.mean(validity_column_scores) * 100.0) if validity_column_scores else 100.0
 
@@ -761,6 +805,9 @@ def score_dataset(
                 col_scores_collector[col].append((drift_score, 1.0))
                 stability_metrics[f"{col}_psi"] = float(psi_val)
                 stability_metrics[f"{col}_jsd"] = float(js_val)
+                per_col_subscores[col]["stability_score"] = round(drift_score * 100.0, 2)
+            else:
+                per_col_subscores[col]["stability_score"] = np.nan
 
         if stability_scores:
             stability_score_val = float(np.mean(stability_scores) * 100.0)
@@ -770,6 +817,9 @@ def score_dataset(
         else:
             stability_applicable = False
             stability_reason = "No drift divergence metrics could be computed between baseline and production"
+    else:
+        for col in df.columns:
+            per_col_subscores[col]["stability_score"] = np.nan
 
     stability_dim = DimensionScore(
         dimension=QualityDimension.STABILITY,
@@ -801,14 +851,16 @@ def score_dataset(
         for ds in dimension_scores.values():
             if ds.applicable:
                 eff_w = ds.configured_weight / total_applicable_configured_w
-                ds.effective_weight = round(eff_w, 4)
+                ds.effective_weight = eff_w
                 ds.weight = ds.effective_weight
             else:
                 ds.effective_weight = 0.0
                 ds.weight = 0.0
 
+        # Exact mathematical score calculation with unrounded weights
         overall_score = sum(
-            ds.score * ds.effective_weight for ds in applicable_dims
+            ds.score * (ds.configured_weight / total_applicable_configured_w)
+            for ds in applicable_dims
         )
         overall_score = float(max(0.0, min(100.0, round(overall_score, 2))))
     else:
@@ -828,4 +880,442 @@ def score_dataset(
             weighted_s = sum(s * w for s, w in pairs)
             final_col_scores[col] = round((weighted_s / tot_w) * 100.0, 2)
 
-    return overall_score, dimension_scores, final_col_scores
+    for col in df.columns:
+        per_col_subscores[col]["overall_column_score"] = final_col_scores.get(col, 100.0)
+
+    if not return_details:
+        return overall_score, dimension_scores, final_col_scores
+
+    # =========================================================================
+    # BUILD EXTENDED ANALYTICAL TABLES (Scoring Matrix, Dimension Summary, Audit)
+    # =========================================================================
+    # 1. Scoring Matrix DataFrame
+    scoring_rows = []
+    for col in df.columns:
+        sc = per_col_subscores.get(col, {})
+        scoring_rows.append({
+            "column_name": col,
+            "completeness_score": sc.get("completeness_score", 100.0),
+            "incomplete_rows_score": np.nan,  # Dataset-level metric: strictly NaN at column level
+            "validity_score": sc.get("validity_score", 100.0),
+            "type_score": sc.get("type_score", np.nan),
+            "whitespace_score": sc.get("whitespace_score", np.nan),
+            "rule_score": sc.get("rule_score", np.nan),
+            "outlier_score": sc.get("outlier_score", np.nan),
+            "duplicate_rows_score": np.nan,   # Dataset-level metric: strictly NaN at column level
+            "stability_score": sc.get("stability_score", np.nan),
+            "overall_column_score": sc.get("overall_column_score", 100.0),
+        })
+    scoring_matrix_df = pd.DataFrame(scoring_rows)
+    if not scoring_matrix_df.empty:
+        scoring_matrix_df.set_index("column_name", inplace=True)
+
+    # 2. Dimension Summary DataFrame with Hare-Niemeyer display reconciliation
+    disp_weights: Dict[str, float] = {}
+    disp_contribs: Dict[str, float] = {}
+
+    if applicable_dims and total_applicable_configured_w > 0:
+        # Reconcile 4-decimal displayed effective weights so sum strictly equals 1.0000
+        w_records = []
+        for ds in applicable_dims:
+            w_raw = ds.effective_weight
+            w_floor = math.floor(w_raw * 10000)
+            w_rem = (w_raw * 10000) - w_floor
+            w_records.append({"dim": ds.dimension.value, "floor": w_floor, "rem": w_rem})
+        w_diff = 10000 - sum(r["floor"] for r in w_records)
+        w_records.sort(key=lambda r: r["rem"], reverse=True)
+        for i in range(min(max(0, w_diff), len(w_records))):
+            w_records[i]["floor"] += 1
+        disp_weights = {r["dim"]: round(r["floor"] / 10000.0, 4) for r in w_records}
+
+        # Reconcile 2-decimal displayed contributions so sum strictly equals overall_score
+        target_cents = round(overall_score * 100)
+        c_records = []
+        for ds in applicable_dims:
+            c_raw = ds.score * ds.effective_weight
+            c_raw_cents = c_raw * 100.0
+            c_floor = math.floor(c_raw_cents)
+            c_rem = c_raw_cents - c_floor
+            c_records.append({"dim": ds.dimension.value, "floor": c_floor, "rem": c_rem})
+        c_diff = target_cents - sum(r["floor"] for r in c_records)
+        c_records.sort(key=lambda r: r["rem"], reverse=True)
+        for i in range(min(max(0, c_diff), len(c_records))):
+            c_records[i]["floor"] += 1
+        disp_contribs = {r["dim"]: round(r["floor"] / 100.0, 2) for r in c_records}
+
+    dim_rows = []
+    for dim_enum in QualityDimension:
+        ds = dimension_scores[dim_enum.value]
+        conf_w = ds.configured_weight
+        eff_w = disp_weights.get(dim_enum.value, 0.0) if ds.applicable else 0.0
+        contrib = disp_contribs.get(dim_enum.value, 0.0) if ds.applicable else 0.0
+        dim_rows.append({
+            "dimension": dim_enum.value,
+            "score": round(ds.score, 2),
+            "configured_weight": round(conf_w, 4),
+            "effective_weight": round(eff_w, 4),
+            "applicable": ds.applicable,
+            "reason": ds.reason,
+            "weighted_contribution": round(contrib, 2),
+        })
+    dimension_summary_df = pd.DataFrame(dim_rows)
+    if not dimension_summary_df.empty:
+        dimension_summary_df.set_index("dimension", inplace=True)
+
+    # 3. Mathematical Scoring Audit Trail
+    trail_lines = [
+        "=========================================================================================",
+        "CLEANALYTIX 6-DIMENSION DATA QUALITY SCORING AUDIT TRAIL",
+        "=========================================================================================",
+        f"Applicability Re-weighting Policy: Exclude non-applicable dimensions; re-normalize configured weights to 1.0.",
+        f"Active Score Mode: {score_mode}",
+        "-----------------------------------------------------------------------------------------",
+    ]
+    for r in dim_rows:
+        dim_name = str(r["dimension"]).capitalize()
+        if r["applicable"]:
+            trail_lines.append(
+                f"  [APPLICABLE]     {dim_name:<14} : Score = {r['score']:>6.2f} / 100.00 | Configured Weight = {r['configured_weight']:.4f} | Effective Weight = {r['effective_weight']:.4f} -> Contribution = {r['weighted_contribution']:>6.2f}"
+            )
+        else:
+            trail_lines.append(
+                f"  [NON-APPLICABLE] {dim_name:<14} : [EXCLUDED FROM SCORE] (Configured Weight = {r['configured_weight']:.4f}) Reason: {r['reason']}"
+            )
+    trail_lines.append("-----------------------------------------------------------------------------------------")
+    tot_eff_w = sum(r["effective_weight"] for r in dim_rows if r["applicable"])
+    trail_lines.append(
+        f"Total Applicable Weight: {tot_eff_w:.4f} | OVERALL DATASET QUALITY SCORE: {overall_score:.2f} / 100.00"
+    )
+    trail_lines.append("=========================================================================================")
+    scoring_audit_trail_str = "\n".join(trail_lines)
+
+    # 4. Metric Inventory DataFrame
+    metric_inventory_df = build_metric_inventory(
+        df=df,
+        meta_df=meta_df,
+        dimension_scores=dimension_scores,
+        thresholds=thresholds,
+        metric_weights=metric_weights,
+        has_baseline=has_baseline,
+        config=config,
+    )
+
+    return (
+        overall_score,
+        dimension_scores,
+        final_col_scores,
+        scoring_matrix_df,
+        dimension_summary_df,
+        metric_inventory_df,
+        scoring_audit_trail_str,
+    )
+
+
+def build_metric_inventory(
+    df: pd.DataFrame,
+    meta_df: pd.DataFrame,
+    dimension_scores: Dict[str, DimensionScore],
+    thresholds: Dict[str, float],
+    metric_weights: Dict[str, float],
+    has_baseline: bool,
+    config: CleanalytixConfig,
+) -> pd.DataFrame:
+    """Build an exhaustive audit ledger of every evaluated metric across dimensions.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Analyzed dataset.
+    meta_df : pd.DataFrame
+        Metadata table.
+    dimension_scores : dict
+        DimensionScore objects.
+    thresholds : dict
+        Metric thresholds.
+    metric_weights : dict
+        Metric-level weights within dimensions.
+    has_baseline : bool
+        Whether baseline comparison was conducted.
+    config : CleanalytixConfig
+        Configuration options.
+
+    Returns
+    -------
+    pd.DataFrame
+        Metric inventory ledger.
+    """
+    rows = []
+    comp_ds = dimension_scores.get(QualityDimension.COMPLETENESS.value)
+    val_ds = dimension_scores.get(QualityDimension.VALIDITY.value)
+    uniq_ds = dimension_scores.get(QualityDimension.UNIQUENESS.value)
+    cons_ds = dimension_scores.get(QualityDimension.CONSISTENCY.value)
+    time_ds = dimension_scores.get(QualityDimension.TIMELINESS.value)
+    stab_ds = dimension_scores.get(QualityDimension.STABILITY.value)
+
+    # 1. COMPLETENESS METRICS
+    # Dataset-level row completeness
+    incomp_pct = comp_ds.metrics.get("incomplete_rows_percent") if comp_ds else 0.0
+    row_score = comp_ds.metric_scores.get("row_completeness_score") if comp_ds else 100.0
+    r_thresh = thresholds.get("missing_percent", 20.0)
+    w_row = metric_weights.get("completeness_row", 0.30)
+    eff_w_comp = comp_ds.effective_weight if comp_ds and comp_ds.applicable else 0.0
+    rows.append({
+        "dimension": QualityDimension.COMPLETENESS.value,
+        "metric_name": "completeness_row",
+        "domain": "completeness",
+        "scope": "dataset",
+        "target_column": None,
+        "raw_value": round(float(incomp_pct), 2) if incomp_pct is not None else 0.0,
+        "unit": "%",
+        "threshold": r_thresh,
+        "status": "PASS" if (incomp_pct or 0) <= r_thresh else "WARNING",
+        "metric_score": row_score,
+        "contributes_to_score": True,
+        "effective_weight": round(w_row * eff_w_comp, 4),
+        "calculation_method": "Percentage of rows containing at least 1 null",
+        "reason": None,
+    })
+
+    # Column-level cell missingness
+    w_cell = metric_weights.get("completeness_cell", 0.70)
+    for _, meta_row in meta_df.iterrows():
+        col = meta_row.get("column_name")
+        m_pct = meta_row.get("missing_percent", 0.0)
+        m_score = calculate_metric_score(float(m_pct or 0), r_thresh, score_mode=config.score_mode) * 100.0
+        rows.append({
+            "dimension": QualityDimension.COMPLETENESS.value,
+            "metric_name": "completeness_cell",
+            "domain": "completeness",
+            "scope": "column",
+            "target_column": col,
+            "raw_value": round(float(m_pct or 0), 2),
+            "unit": "%",
+            "threshold": r_thresh,
+            "status": "PASS" if (m_pct or 0) <= r_thresh else ("CRITICAL" if (m_pct or 0) > 2 * r_thresh else "WARNING"),
+            "metric_score": round(m_score, 2),
+            "contributes_to_score": True,
+            "effective_weight": round((w_cell / max(1, len(meta_df))) * eff_w_comp, 4),
+            "calculation_method": "Column cell null percentage",
+            "reason": None,
+        })
+
+    # 2. VALIDITY METRICS
+    eff_w_val = val_ds.effective_weight if val_ds and val_ds.applicable else 0.0
+    t_thresh = thresholds.get("type_errors_percent", 2.0)
+    ws_thresh = thresholds.get("whitespace_percent", 5.0)
+    rule_thresh = thresholds.get("rule_errors_percent", 2.0)
+    out_thresh = thresholds.get("outlier_percent", 10.0)
+
+    for _, meta_row in meta_df.iterrows():
+        col = meta_row.get("column_name")
+        role = str(meta_row.get("column_role", "unknown"))
+        non_null = int(meta_row.get("non_null_count", 0))
+
+        # Type errors
+        t_err = meta_row.get("type_errors", 0)
+        t_pct = (float(t_err or 0) / max(1, non_null)) * 100.0
+        t_score = calculate_metric_score(t_pct, t_thresh, score_mode=config.score_mode) * 100.0
+        rows.append({
+            "dimension": QualityDimension.VALIDITY.value,
+            "metric_name": "validity_type_errors",
+            "domain": "validity",
+            "scope": "column",
+            "target_column": col,
+            "raw_value": round(t_pct, 2),
+            "unit": "%",
+            "threshold": t_thresh,
+            "status": "PASS" if t_pct <= t_thresh else "WARNING",
+            "metric_score": round(t_score, 2),
+            "contributes_to_score": True,
+            "effective_weight": None,
+            "calculation_method": "Semantic type conformance errors",
+            "reason": None,
+        })
+
+        # Whitespace
+        if role in {"categorical", "free_text", "identifier"}:
+            ws_err = meta_row.get("whitespace_issues", 0)
+            ws_pct = (float(ws_err or 0) / max(1, non_null)) * 100.0
+            w_score = calculate_metric_score(ws_pct, ws_thresh, score_mode=config.score_mode) * 100.0
+            rows.append({
+                "dimension": QualityDimension.VALIDITY.value,
+                "metric_name": "validity_whitespace",
+                "domain": "validity",
+                "scope": "column",
+                "target_column": col,
+                "raw_value": round(ws_pct, 2),
+                "unit": "%",
+                "threshold": ws_thresh,
+                "status": "PASS" if ws_pct <= ws_thresh else "WARNING",
+                "metric_score": round(w_score, 2),
+                "contributes_to_score": True,
+                "effective_weight": None,
+                "calculation_method": "Untrimmed leading/trailing whitespace",
+                "reason": None,
+            })
+
+        # Outliers
+        if role in {"continuous", "discrete"}:
+            out_cnt = meta_row.get("outlier_count", 0)
+            out_pct = (float(out_cnt or 0) / max(1, non_null)) * 100.0
+            o_score = calculate_metric_score(out_pct, out_thresh, score_mode=config.score_mode) * 100.0
+            rows.append({
+                "dimension": QualityDimension.VALIDITY.value,
+                "metric_name": "validity_outliers",
+                "domain": "validity",
+                "scope": "column",
+                "target_column": col,
+                "raw_value": round(out_pct, 2),
+                "unit": "%",
+                "threshold": out_thresh,
+                "status": "PASS" if out_pct <= out_thresh else "WARNING",
+                "metric_score": round(o_score, 2),
+                "contributes_to_score": True,
+                "effective_weight": None,
+                "calculation_method": "Heuristic statistical outlier containment",
+                "reason": None,
+            })
+
+    # 3. UNIQUENESS METRICS
+    eff_w_uniq = uniq_ds.effective_weight if uniq_ds and uniq_ds.applicable else 0.0
+    dup_row_pct = uniq_ds.metrics.get("duplicate_rows_percent", 0.0) if uniq_ds else 0.0
+    dup_thresh = thresholds.get("duplicate_rows_percent", 1.0)
+    rows.append({
+        "dimension": QualityDimension.UNIQUENESS.value,
+        "metric_name": "uniqueness_duplicate_rows",
+        "domain": "uniqueness",
+        "scope": "dataset",
+        "target_column": None,
+        "raw_value": round(float(dup_row_pct), 2),
+        "unit": "%",
+        "threshold": dup_thresh,
+        "status": "PASS" if dup_row_pct <= dup_thresh else "WARNING",
+        "metric_score": uniq_ds.metric_scores.get("duplicate_rows_score", 100.0) if uniq_ds else 100.0,
+        "contributes_to_score": True,
+        "effective_weight": round(eff_w_uniq * 0.50, 4),
+        "calculation_method": "Duplicate rows percentage",
+        "reason": None,
+    })
+
+    # 4. CONSISTENCY METRICS
+    eff_w_cons = cons_ds.effective_weight if cons_ds and cons_ds.applicable else 0.0
+    if cons_ds and cons_ds.applicable:
+        rows.append({
+            "dimension": QualityDimension.CONSISTENCY.value,
+            "metric_name": "consistency_rules",
+            "domain": "consistency",
+            "scope": "dataset",
+            "target_column": None,
+            "raw_value": cons_ds.score,
+            "unit": "score [0-100]",
+            "threshold": rule_thresh,
+            "status": "PASS" if cons_ds.score >= 90.0 else "WARNING",
+            "metric_score": cons_ds.score,
+            "contributes_to_score": True,
+            "effective_weight": round(eff_w_cons, 4),
+            "calculation_method": "Cross-column relational business rule evaluation",
+            "reason": None,
+        })
+    else:
+        rows.append({
+            "dimension": QualityDimension.CONSISTENCY.value,
+            "metric_name": "consistency_rules",
+            "domain": "consistency",
+            "scope": "dataset",
+            "target_column": None,
+            "raw_value": None,
+            "unit": "%",
+            "threshold": rule_thresh,
+            "status": "NOT_APPLICABLE",
+            "metric_score": None,
+            "contributes_to_score": False,
+            "effective_weight": 0.0,
+            "calculation_method": "Cross-column relational business rule evaluation",
+            "reason": cons_ds.reason if cons_ds else "No consistency rules configured",
+        })
+
+    # 5. TIMELINESS METRICS
+    eff_w_time = time_ds.effective_weight if time_ds and time_ds.applicable else 0.0
+    if time_ds and time_ds.applicable:
+        fresh_days = time_ds.metrics.get("freshness_days")
+        fut_pct = time_ds.metrics.get("future_dates_percent", 0.0)
+        rows.append({
+            "dimension": QualityDimension.TIMELINESS.value,
+            "metric_name": "timeliness_freshness",
+            "domain": "timeliness",
+            "scope": "column",
+            "target_column": None,
+            "raw_value": round(float(fresh_days), 2) if fresh_days is not None else None,
+            "unit": "days",
+            "threshold": thresholds.get("freshness_days", 30.0),
+            "status": "PASS" if (fresh_days or 0) <= thresholds.get("freshness_days", 30.0) else "WARNING",
+            "metric_score": time_ds.metric_scores.get("freshness_score", 100.0),
+            "contributes_to_score": True,
+            "effective_weight": round(eff_w_time * 0.50, 4),
+            "calculation_method": "Elapsed days between max timestamp and reference time",
+            "reason": None,
+        })
+    else:
+        rows.append({
+            "dimension": QualityDimension.TIMELINESS.value,
+            "metric_name": "timeliness_freshness",
+            "domain": "timeliness",
+            "scope": "column",
+            "target_column": None,
+            "raw_value": None,
+            "unit": "days",
+            "threshold": thresholds.get("freshness_days", 30.0),
+            "status": "NOT_APPLICABLE",
+            "metric_score": None,
+            "contributes_to_score": False,
+            "effective_weight": 0.0,
+            "calculation_method": "Elapsed days between max timestamp and reference time",
+            "reason": time_ds.reason if time_ds else "No datetime columns detected",
+        })
+
+    # 6. STABILITY METRICS
+    eff_w_stab = stab_ds.effective_weight if stab_ds and stab_ds.applicable else 0.0
+    if stab_ds and stab_ds.applicable:
+        for _, meta_row in meta_df.iterrows():
+            col = meta_row.get("column_name")
+            psi_val = meta_row.get("psi_divergence")
+            if pd.notna(psi_val):
+                p_thresh = thresholds.get("psi_divergence", 0.25)
+                p_score = calculate_metric_score(float(psi_val), p_thresh, score_mode=config.score_mode, k=3.0) * 100.0
+                rows.append({
+                    "dimension": QualityDimension.STABILITY.value,
+                    "metric_name": "stability_psi",
+                    "domain": "drift_analysis",
+                    "scope": "column",
+                    "target_column": col,
+                    "raw_value": round(float(psi_val), 4),
+                    "unit": "PSI",
+                    "threshold": p_thresh,
+                    "status": "PASS" if float(psi_val) < 0.10 else ("WARNING" if float(psi_val) < p_thresh else "CRITICAL"),
+                    "metric_score": round(p_score, 2),
+                    "contributes_to_score": True,
+                    "effective_weight": round(eff_w_stab * 0.50 / max(1, len(meta_df)), 4),
+                    "calculation_method": "Population Stability Index against reference baseline",
+                    "reason": None,
+                })
+    else:
+        rows.append({
+            "dimension": QualityDimension.STABILITY.value,
+            "metric_name": "stability_psi",
+            "domain": "drift_analysis",
+            "scope": "column",
+            "target_column": None,
+            "raw_value": None,
+            "unit": "PSI",
+            "threshold": thresholds.get("psi_divergence", 0.25),
+            "status": "NOT_APPLICABLE",
+            "metric_score": None,
+            "contributes_to_score": False,
+            "effective_weight": 0.0,
+            "calculation_method": "Population Stability Index against reference baseline",
+            "reason": stab_ds.reason if stab_ds else "No baseline reference dataset provided",
+        })
+
+    inv_df = pd.DataFrame(rows)
+    return inv_df
+

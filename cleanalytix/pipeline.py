@@ -14,16 +14,24 @@ import pandas as pd
 import numpy as np
 
 from cleanalytix.generate_meta import generate_meta
-from cleanalytix.cleaning_recommendations import cleaning_recommendations
+from cleanalytix.cleaning_recommendations import cleaning_recommendations, generate_recommendations
 from cleanalytix.get_table_for_DQ_computation import get_table_for_DQ_computation
 from cleanalytix.summarize_dataset_health import summarize_dataset_health
 from cleanalytix.compute_dq_score import Compute_DQ_Score, DEFAULT_SCORE_MODE
 from cleanalytix.adjust_prod_meta import learn_reference_profile, adjust_prod_meta_with_reference
 from cleanalytix.preprocess_types import infer_and_fix_types
 from cleanalytix.scoring import score_dataset, resolve_thresholds
-from cleanalytix.insights import generate_dataset_insights
+from cleanalytix.insights import generate_dataset_insights, build_anomalies_dataframe
 from cleanalytix.metrics.uniqueness import detect_candidate_keys, compute_duplicate_row_metrics
 from cleanalytix.metrics.relationships import compute_numeric_correlations
+from cleanalytix.profiling import (
+    build_dataset_profile,
+    build_column_profile,
+    build_statistical_profile,
+    build_relationship_profile,
+    build_temporal_profile,
+    build_drift_profile,
+)
 from cleanalytix.types import (
     DQPipelineResult,
     MetricWeights,
@@ -35,6 +43,7 @@ from cleanalytix.types import (
     CleanalytixResult,
     AnalysisLevel,
     FeatureRetiredError,
+    InsightSeverity,
 )
 
 
@@ -114,44 +123,118 @@ def analyze(
             rules=config.rules,
         )
 
-    # Step 2: Scoring across Quality Dimensions
-    overall_score, dim_scores, col_scores = score_dataset(
-        df, meta_df, config=config, has_baseline=has_baseline
+    # Step 2: Scoring across Quality Dimensions with full audit ledger
+    (
+        overall_score,
+        dim_scores,
+        col_scores,
+        scoring_matrix_df,
+        dimension_summary_df,
+        metric_inventory_df,
+        scoring_audit_trail_str,
+    ) = score_dataset(
+        df, meta_df, config=config, has_baseline=has_baseline, return_details=True
     )
 
-    # Step 3: Insights & Actionable Recommendations
+    # Step 3: Insights & Anomaly Diagnostics
     thresholds = resolve_thresholds(config.thresholds)
     insights = generate_dataset_insights(
         meta_df, thresholds, has_baseline=has_baseline, quality_dimensions=dim_scores
     )
+    anomalies = build_anomalies_dataframe(insights)
 
-    # Step 4: Specialized Key and Relationship Discovery
+    # Step 4: Structured Recommendations Engine
+    recs, recs_table = generate_recommendations(meta_df, insights=insights)
+
+    critical_count = sum(
+        1 for it in insights
+        if getattr(it, "severity", None) in {InsightSeverity.CRITICAL, "CRITICAL"}
+    )
+    warning_count = sum(
+        1 for it in insights
+        if getattr(it, "severity", None) in {InsightSeverity.WARNING, "WARNING"}
+    )
+    recommendations_count = len(recs)
+
+    # Step 5: Domain Profiling across 10 Analytical Domains
+    dataset_profile = build_dataset_profile(
+        df,
+        meta_df,
+        overall_score=overall_score,
+        dim_scores=dim_scores,
+        critical_count=critical_count,
+        warning_count=warning_count,
+        recommendations_count=recommendations_count,
+        baseline_df=baseline_df,
+        dataset_name=dataset_name,
+    )
+    column_profile = build_column_profile(df, meta_df, col_scores)
+    statistical_profile = build_statistical_profile(df, meta_df)
+    relationships = build_relationship_profile(df, config=config)
+    temporal_profile = build_temporal_profile(df, meta_df, config=config)
+    drift_profile = build_drift_profile(df, baseline_df, meta_df)
+
+    # Step 6: Standardized Metrics Table & Health Summary
+    metrics_table = get_table_for_DQ_computation(meta_df, [df], [dataset_name])
+    health_summary = summarize_dataset_health(meta_df)
+
+    # Step 7: Legacy Pipeline Block Compatibility
     dup_row_info = compute_duplicate_row_metrics(df)
-    key_info = detect_candidate_keys(df)
+    key_info = relationships.candidate_keys
+    rel_info = compute_numeric_correlations(df) if level in {AnalysisLevel.STANDARD, AnalysisLevel.DEEP} else {}
 
-    # Convert insights to recommendations (advisory)
-    recs = [item for item in insights if item.recommendation]
+    drift_summary = {
+        "has_baseline": has_baseline,
+        "candidate_keys": key_info,
+        "duplicate_rows": dup_row_info,
+        "relationships": rel_info,
+    }
 
-    # Additional correlation metrics if deep or standard
-    rel_info = {}
-    if level in {AnalysisLevel.STANDARD, AnalysisLevel.DEEP}:
-        rel_info = compute_numeric_correlations(df)
+    base_data = _empty_base_block()
+    base_data.update({
+        "dirty_scores": pd.DataFrame([{"Dataset_name": dataset_name, "DQ_Score": overall_score}]),
+        "meta_before_cleaning": meta_df,
+        "recommendations": cleaning_recommendations(meta_df),
+        "summarized_before": health_summary,
+        "main_metrics_before": metrics_table,
+    })
 
-    # Build CleanalytixResult
+    prod_data = {}
+    if has_baseline:
+        prod_data = _empty_base_block()
+        prod_data.update({
+            "dirty_scores": pd.DataFrame([{"Dataset_name": dataset_name, "DQ_Score": overall_score}]),
+            "meta_before_cleaning": meta_df,
+            "recommendations": cleaning_recommendations(meta_df),
+            "summarized_before": health_summary,
+            "main_metrics_before": metrics_table,
+        })
+
+    # Step 8: Build Comprehensive CleanalytixResult
     result = CleanalytixResult(
         overall_score=overall_score,
         quality_dimensions=dim_scores,
         column_scores=col_scores,
-        metadata=meta_df,
+        dataset_profile=dataset_profile,
+        column_profile=column_profile,
+        statistical_profile=statistical_profile,
+        scoring_matrix=scoring_matrix_df,
+        dimension_summary=dimension_summary_df,
+        metrics_table=metrics_table,
+        metric_inventory=metric_inventory_df,
+        relationships=relationships,
+        temporal_profile=temporal_profile,
+        drift_profile=drift_profile,
+        anomalies=anomalies,
+        recommendations_table=recs_table,
         recommendations=recs,
         insights=insights,
-        metrics_table=meta_df,
-        drift_summary={
-            "has_baseline": has_baseline,
-            "candidate_keys": key_info,
-            "duplicate_rows": dup_row_info,
-            "relationships": rel_info,
-        },
+        scoring_audit_trail=scoring_audit_trail_str,
+        health_summary=health_summary,
+        metadata=meta_df,
+        drift_summary=drift_summary,
+        base_data=base_data,
+        prod_data=prod_data,
     )
     return result
 

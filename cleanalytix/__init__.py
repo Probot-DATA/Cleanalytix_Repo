@@ -47,11 +47,21 @@ from cleanalytix.types import (
     QualityDimension,
     InsightSeverity,
     InsightItem,
+    RecommendationItem,
     DimensionScore,
+    DatasetProfile,
+    RelationshipProfile,
     CleanalytixConfig,
     CleanalytixResult,
     FeatureRetiredError,
     DQPipelineResult,
+)
+from cleanalytix.registry import (
+    MetricDefinition,
+    MetricRegistry,
+    MetricDomain,
+    MetricScope,
+    MetricValueStatus,
 )
 from cleanalytix import metrics
 
@@ -63,6 +73,9 @@ __all__ = [
     "score_dataset",
     "CleanalytixConfig",
     "CleanalytixResult",
+    "DatasetProfile",
+    "RelationshipProfile",
+    "RecommendationItem",
     "QualityDimension",
     "DimensionScore",
     "InsightItem",
@@ -71,6 +84,12 @@ __all__ = [
     "FeatureRetiredError",
     "diagnose_column_types",
     "metrics",
+    # Metric Registry
+    "MetricDefinition",
+    "MetricRegistry",
+    "MetricDomain",
+    "MetricScope",
+    "MetricValueStatus",
     # Legacy & Pipeline API
     "Run_DQ_Pipeline",
     "run_dq_pipeline",

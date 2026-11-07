@@ -334,3 +334,40 @@ def generate_dataset_insights(
     insights.sort(key=lambda item: severity_order.get(item.severity, 99))
 
     return insights
+
+
+def build_anomalies_dataframe(insights: List[InsightItem]) -> pd.DataFrame:
+    """Format structured insight findings into a tabular anomaly DataFrame.
+
+    Parameters
+    ----------
+    insights : list of InsightItem
+        Detected quality anomalies and findings.
+
+    Returns
+    -------
+    pd.DataFrame
+        Tabular anomaly diagnostics with severity, dimension, column,
+        metric, threshold, message, and recommendation.
+    """
+    rows = []
+    for item in (insights or []):
+        dim_str = item.dimension.value if isinstance(item.dimension, QualityDimension) else str(item.dimension)
+        sev_str = item.severity.value if isinstance(item.severity, InsightSeverity) else str(item.severity)
+        rows.append({
+            "severity": sev_str,
+            "dimension": dim_str,
+            "column": item.column,
+            "metric_name": item.metric_name,
+            "metric_value": item.metric_value,
+            "threshold": item.threshold,
+            "message": item.message,
+            "recommendation": item.recommendation,
+        })
+    if not rows:
+        return pd.DataFrame(columns=[
+            "severity", "dimension", "column", "metric_name", "metric_value",
+            "threshold", "message", "recommendation"
+        ])
+    return pd.DataFrame(rows)
+

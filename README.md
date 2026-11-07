@@ -103,6 +103,89 @@ Actionable Recommendations:
 
 ---
 
+## 10-Domain Comprehensive Analytical Architecture
+
+Cleanalytix organizes Data Quality Intelligence across 10 structured analytical domains, exposed both as object properties and exportable DataFrames via `result.to_dataframe(view=...)`:
+
+| Domain | Property / Method | Description |
+| :--- | :--- | :--- |
+| **1. Dataset Profiling** | `result.dataset_profile` | Executive dataset metrics: row/column counts, memory usage (MB, per-row), null density, complete/empty row counts, duplicate rows/columns, candidate keys. |
+| **2. Column Profiling** | `result.column_profile` | Deep per-column metadata: inferred semantic roles, physical dtypes, distinct values, uniqueness, constant flags, mode frequencies, and conformance error counts. |
+| **3. Metric Transparency** | `result.scoring_matrix`<br>`result.metrics_table`<br>`result.metric_inventory` | Granular per-column penalty matrix, standardized percentage DQ metrics table, and exhaustive audit ledger linking each metric to its catalog definition. |
+| **4. Dimension Transparency** | `result.dimension_summary`<br>`result.scoring_audit_trail` | 6-dimension scoreboard with configured weights, applicability status, effective weights, weighted contributions, and human-readable audit trail. |
+| **5. Statistical Intelligence** | `result.statistical_profile` | Bessel sample variance ($ddof=1$), standard deviation, Fisher excess kurtosis, skewness, MAD, IQR, percentiles ($p01$–$p99$), zero/negative ratios, HHI, and Gini-Simpson diversity. |
+| **6. Relationship Analysis** | `result.relationships`<br>`result.correlations`<br>`result.candidate_keys` | Pearson/Spearman correlation matrices, Cramér's V associations, collinearity pairs ($|r| \ge 0.85$), missingness empirical Jaccard co-occurrence, and single/composite keys. |
+| **7. Temporal Analysis** | `result.temporal_profile` | Datetime parse rate, time span, freshness days/status, detected cadence (e.g. Daily, Hourly), median step, max gap, sequence monotonicity, and future timestamps. |
+| **8. Drift Intelligence** | `result.drift_profile` | Baseline distribution drift tests: 2-sample Kolmogorov-Smirnov test ($p$-value, statistic), normalized Wasserstein distance, Jeffreys PSI, JSD, and unseen categories. |
+| **9. Anomaly Diagnostics** | `result.anomalies`<br>`result.insights` | Structured tabular diagnostics of detected anomalies categorized by severity (Critical, Warning, Info, Optimization), dimension, metric, and threshold. |
+| **10. Actionable Recommendations**| `result.recommendations_table`<br>`result.recommendations` | Deterministic, ranked remediation recommendations with 1-based priority ranks, rule IDs (1–10), affected columns, analytical rationale, and code fixes. |
+
+---
+
+## Unified Analytical View Selector (`to_dataframe`)
+
+Export any analytical domain directly to a pandas DataFrame using `result.to_dataframe(view)`:
+
+```python
+# Column-level profiling
+df_cols = result.to_dataframe("columns")
+
+# Deep statistical moments and percentiles
+df_stats = result.to_dataframe("statistics")
+
+# Per-column scoring penalty matrix
+df_scoring = result.to_dataframe("scoring")
+
+# 6-dimension scoreboard and weights
+df_dims = result.to_dataframe("dimensions")
+
+# Metric audit inventory
+df_inv = result.to_dataframe("inventory")
+
+# Cross-column Pearson correlations
+df_corr = result.to_dataframe("relationships")
+
+# Temporal coverage and cadence
+df_temp = result.to_dataframe("temporal")
+
+# Baseline drift diagnostics
+df_drift = result.to_dataframe("drift")
+
+# Anomaly diagnostics
+df_anom = result.to_dataframe("anomalies")
+
+# Ranked recommendations table
+df_recs = result.to_dataframe("recommendations")
+
+# Executive dataset summary (1 row)
+df_dataset = result.to_dataframe("dataset")
+```
+
+---
+
+## Standardized Metric Registry & Catalog
+
+Cleanalytix features a centralized, thread-safe `MetricRegistry` maintaining definitions, domains, scopes, units, calculation formulas, and scoring contributions for all metrics:
+
+```python
+from cleanalytix import MetricRegistry, MetricDomain, QualityDimension
+
+# Query metric definition by name or standardized alias
+m = MetricRegistry.get("cell_missingness_percent")
+print(f"Metric: {m.display_name} ({m.unit})")
+print(f"Domain: {m.domain.value} | Dimension: {m.dimension.value}")
+print(f"Formula: {m.calculation_method}")
+
+# Query all metrics contributing to quality scoring
+scoring_metrics = MetricRegistry.scoring_metrics()
+print(f"Scoring metrics count: {len(scoring_metrics)}")
+
+# Query all metrics within a specific domain
+validity_metrics = MetricRegistry.by_domain(MetricDomain.VALIDITY)
+```
+
+---
+
 ## Production Monitoring & Distribution Drift
 
 Compare newly arrived production datasets against baseline distributions:

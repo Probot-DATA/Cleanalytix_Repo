@@ -1,26 +1,74 @@
-# Python caches and build outputs
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
+*$py.class
+*.so
 
-# Virtual environments
-.venv/
-venv/
+# C/C++ build artifacts and extensions
+*.o
+*.obj
+*.dll
+*.dylib
 
-# Packaging artifacts
+# Packaging and distribution
 build/
 dist/
 *.egg-info/
 .eggs/
+*.egg
+MANIFEST
 
-# Jupyter
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.clean_verify_env/
+
+# Testing and code coverage
+.pytest_cache/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.ruff_cache/
+.mypy_cache/
+tests/outputs/*
+!tests/outputs/.gitkeep
+
+# Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
-# Validation data and generated outputs
+# IDE, editor, and OS workspace artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# Environment variables, credentials, and secrets
+.env
+.env.*
+*.pem
+*.key
+*.cert
+*.crt
+
+# Execution logs
+*.log
+logs/
+
+# Validation data and large generated datasets
 validation/datasets/**
 !validation/datasets/
 !validation/datasets/README.md
@@ -34,6 +82,13 @@ validation/datasets/**
 !validation/datasets/yellow_trip_data/.gitkeep
 !validation/datasets/CC_GENERAL/
 !validation/datasets/CC_GENERAL/.gitkeep
-# Optional local test output scratch space
-tests/outputs/*
-!tests/outputs/.gitkeep
+
+# Internal development notes, redundant audit reports, and scratch scripts
+COMPREHENSIVE_ANALYTICAL_OUTPUTS_*.md
+DETAILED_OUTPUTS_FEASIBILITY_REPORT.md
+FINAL_ANALYTICAL_OUTPUTS_VERIFICATION.md
+audit_reports/COMPREHENSIVE_ANALYTICAL_OUTPUTS_*.md
+audit_reports/DETAILED_OUTPUTS_FEASIBILITY_REPORT.md
+audit_reports/FINAL_ANALYTICAL_OUTPUTS_VERIFICATION.md
+audit_reports/benchmark_empirical.py
+verify_clean_install.py

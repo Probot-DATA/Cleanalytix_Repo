@@ -93,13 +93,13 @@ def compute_numeric_drift(
     pooled_std = math.sqrt(0.5 * (b_std**2 + p_std**2)) if (b_std + p_std) > 0 else 1.0
     norm_w = float(w_dist / pooled_std) if pooled_std > 1e-12 else 0.0
 
-    # 3. Discretization for PSI, KL, and JS Divergence
+    # 3. Discretization for Binned PSI, KL, and JS Divergence
     if b_min == b_max:
         # Constant baseline: discrete 3-bin surrogate approximation (partitioning into before, at, and after constant value)
         delta = 1e-7 * (abs(b_min) + 1.0)
         bin_edges = np.array([-np.inf, b_min - delta, b_min + delta, np.inf])
     else:
-        # Quantile binning over baseline
+        # 10-quantile binning over baseline distribution
         quantiles = np.linspace(0, 100, num_bins + 1)
         bin_edges = np.percentile(b_arr, quantiles)
         bin_edges = np.unique(bin_edges)
@@ -114,19 +114,19 @@ def compute_numeric_drift(
     p_counts, _ = np.histogram(p_arr, bins=bin_edges)
     k = len(b_counts)
 
-    # Laplace smoothing
+    # Laplace smoothing across bins
     p_b = (b_counts + epsilon) / (n_b + epsilon * k)
     p_p = (p_counts + epsilon) / (n_p + epsilon * k)
 
-    # Exact Kullback-Leibler divergences
+    # Discrete Kullback-Leibler divergences over bins
     kl_bp = float(np.sum(p_b * np.log(p_b / p_p)))
     kl_pb = float(np.sum(p_p * np.log(p_p / p_b)))
 
-    # Exact Population Stability Index (symmetric Jeffreys divergence: KL(P||Q) + KL(Q||P))
+    # Binned Population Stability Index (discrete symmetric Jeffreys divergence: KL(P||Q) + KL(Q||P))
     psi_val = float(np.sum((p_p - p_b) * np.log(p_p / p_b)))
     psi_val = max(0.0, psi_val)
 
-    # Exact Jensen-Shannon Divergence: 0.5 * KL(P||M) + 0.5 * KL(Q||M), M = 0.5 * (P + Q)
+    # Discrete Jensen-Shannon Divergence over bins: 0.5 * KL(P||M) + 0.5 * KL(Q||M), M = 0.5 * (P + Q)
     m = 0.5 * (p_b + p_p)
     jsd_val = float(0.5 * np.sum(p_b * np.log(p_b / m)) + 0.5 * np.sum(p_p * np.log(p_p / m)))
     jsd_val = max(0.0, jsd_val)
