@@ -1,66 +1,38 @@
+"""Legacy data quality scoring module for Cleanalytix.
+
+Provides backward-compatible interfaces to Compute_DQ_Score and get_new_values.
+"""
+
+from __future__ import annotations
+
 import math
 import warnings
-from typing import Dict, List, Optional
+from typing import Final, Optional, Sequence, Union, cast
+
 import numpy as np
 import pandas as pd
 
-# Default thresholds for metrics (values from design assumptions).
-# Keys are in LOWERCASE for easier matching.
-# Note: 'skewness' is NOT scored (see _metric_columns); kept only for reference.
-DEFAULT_THRESHOLDS: Dict[str, float] = {
-    "missing_percent": 20.0,
-    "outlier_percent": 10.0,
-    "whitespace_percent": 5.0,
-    "type_errors_percent": 2.0,
-    "rule_errors_percent": 2.0,
-    "psi_divergence": 0.25,
-    "js_divergence": 0.10,
-}
+from cleanalytix.types import MetricWeights, ScoreMode, Thresholds
+from cleanalytix.scoring import (
+    DEFAULT_THRESHOLDS,
+    resolve_thresholds,
+    calculate_metric_score,
+)
 
-DEFAULT_SCORE_MODE = "linear"
-VALID_SCORE_MODES = {"linear", "exponential"}
+WeightsInput = Optional[Union[MetricWeights, np.ndarray, pd.Series]]
+DEFAULT_SCORE_MODE: Final[ScoreMode] = "linear"
+VALID_SCORE_MODES: Final[set[ScoreMode]] = {"linear", "exponential"}
 
 
-def resolve_thresholds(user_thresholds: Optional[Dict[str, float]] = None) -> Dict[str, float]:
-    """
-    Merge user-provided thresholds into DEFAULT_THRESHOLDS.
-    Keys are case-insensitive; unknown keys are reported and ignored.
-    """
-    final = {k.lower(): float(v) for k, v in DEFAULT_THRESHOLDS.items()}
-    if not user_thresholds:
-        return final
-
-    for key, val in user_thresholds.items():
-        key_lower = key.lower()
-        if key_lower in final:
-            try:
-                final[key_lower] = float(val)
-            except (TypeError, ValueError):
-                raise ValueError(f"Threshold for '{key}' must be numeric")
-        else:
-            warnings.warn(
-                f"Unknown threshold key '{key}' — ignoring it.",
-                UserWarning,
-                stacklevel=3,
-            )
-
-    return final
-
-
-def _metric_columns(summarized_meta: pd.DataFrame) -> List[str]:
-    """
-    Return the list of metric column names from summarized_meta,
-    excluding metadata columns.
-    """
+def _metric_columns(summarized_meta: pd.DataFrame) -> list[str]:
+    """Return metric column names from summarized_meta, excluding metadata columns."""
     drop_cols = {"skewness", "skewness_level", "dataset_name", "column_name"}
     metrics = [col for col in summarized_meta.columns if col not in drop_cols]
     return metrics
 
 
-def _validate_score_mode(score_mode: str) -> str:
-    """
-    Normalize and validate scoring mode.
-    """
+def _validate_score_mode(score_mode: str) -> ScoreMode:
+    """Normalize and validate scoring mode."""
     if not isinstance(score_mode, str):
         raise TypeError("score_mode must be a string: 'linear' or 'exponential'")
 
@@ -70,14 +42,11 @@ def _validate_score_mode(score_mode: str) -> str:
             f"Invalid score_mode '{score_mode}'. "
             f"Expected one of: {sorted(VALID_SCORE_MODES)}"
         )
-    return mode
+    return cast(ScoreMode, mode)
 
 
-def get_weights(weights, summarized_meta):
-    """
-    Validate or create weights for metrics. Returns a list of floats that sum to 1.
-    Raises TypeError/ValueError on invalid input.
-    """
+def get_weights(weights: WeightsInput, summarized_meta: pd.DataFrame) -> list[float]:
+    """Validate or create metric weights for data-quality scoring."""
     metrics = _metric_columns(summarized_meta)
     n = len(metrics)
 
@@ -97,61 +66,15 @@ def get_weights(weights, summarized_meta):
     return []
 
 
-def _linear_score(value: float, threshold: float) -> float:
-    """
-    Linear decay score in [0,1].
-    0 -> 1.0, threshold -> 0.0, above threshold -> 0.0
-    """
-    if threshold is None or threshold <= 0 or not np.isfinite(threshold):
-        threshold = 1.0
-    v = max(0.0, float(value))
-    score = 1.0 - (v / threshold)
-    return float(max(0.0, min(1.0, score)))
-
-
-def _exp_score(value: float, threshold: float, k: float = 2.0) -> float:
-    """
-    Apply exponential decay to a positive metric value.
-    Returns a score in (0,1], with larger value -> lower score.
-    """
-    if threshold is None or threshold <= 0 or not np.isfinite(threshold):
-        threshold = 1.0
-    v = max(0.0, float(value))
-    severity = v / threshold
-    return float(np.exp(-k * severity))
-
-
-def _score_value(
-    value: float,
-    threshold: float,
-    score_mode: str = DEFAULT_SCORE_MODE,
-    k: float = 2.0
-) -> float:
-    """
-    Convert a raw metric value into a [0,1] score using the selected mode.
-    """
-    mode = _validate_score_mode(score_mode)
-
-    if mode == "linear":
-        return _linear_score(value, threshold)
-
-    return _exp_score(value, threshold, k=k)
-
-
 def get_new_values(
     summarized_meta: pd.DataFrame,
-    thresholds: Optional[Dict[str, float]] = None,
-    score_mode: str = DEFAULT_SCORE_MODE
+    thresholds: Optional[Thresholds] = None,
+    score_mode: ScoreMode = DEFAULT_SCORE_MODE,
 ) -> pd.DataFrame:
-    """
-    Return a new DataFrame where each metric column is replaced by a score in [0,1].
-    The score mode can be 'linear' or 'exponential'.
-    Missing values are scored as 1.0.
-    """
+    """Convert scoring-ready metric values into per-metric scores in [0.0, 1.0]."""
     thr_map = resolve_thresholds(thresholds)
     metrics = _metric_columns(summarized_meta)
     temp = summarized_meta.copy(deep=True)
-    # Validate score_mode once — not inside the per-row loop
     mode = _validate_score_mode(score_mode)
 
     for metric in metrics:
@@ -161,17 +84,12 @@ def get_new_values(
         for _, row in temp.iterrows():
             v = row.get(metric, np.nan)
             if pd.isna(v):
-                scores.append(1.0)
+                scores.append(np.nan)
                 continue
 
-            if metric_key in {"psi_divergence", "js_divergence"}:
-                # Divergence metrics use steeper decay (k=3)
-                thr = thr_map.get(metric_key, 1.0)
-                scores.append(_score_value(float(v), float(thr), score_mode=mode, k=3.0))
-
-            else:
-                thr = thr_map.get(metric_key, 1.0)
-                scores.append(_score_value(float(v), float(thr), score_mode=mode, k=2.0))
+            k_val = 3.0 if metric_key in {"psi_divergence", "js_divergence"} else 2.0
+            thr = thr_map.get(metric_key, 1.0)
+            scores.append(calculate_metric_score(float(v), float(thr), score_mode=mode, k=k_val))
 
         temp[metric] = scores
 
@@ -179,57 +97,62 @@ def get_new_values(
 
 
 def Compute_DQ_Score(
-    dataset_name_list: List[str],
-    dataset_list: List[pd.DataFrame],
+    dataset_name_list: Sequence[str],
+    dataset_list: Sequence[pd.DataFrame],
     summarized_meta: pd.DataFrame,
-    given_weights: Optional[List[float]] = None,
-    thresholds: Optional[Dict[str, float]] = None,
-    score_mode: str = DEFAULT_SCORE_MODE
-) -> Dict[str, float]:
-    """
-    Compute DQ score for each dataset in dataset_list.
-
-    Returns:
-        Dict[str, float]: {dataset_name: score}
-
-    score_mode:
-        - 'linear'
-        - 'exponential'
-    """
-    thr_map = resolve_thresholds(thresholds)
+    given_weights: WeightsInput = None,
+    thresholds: Optional[Thresholds] = None,
+    score_mode: ScoreMode = DEFAULT_SCORE_MODE,
+) -> dict[str, float]:
+    """Compute one data-quality score per dataset with dynamic applicability re-weighting."""
     metrics = _metric_columns(summarized_meta)
-    scored_meta = get_new_values(summarized_meta, thresholds=thr_map, score_mode=score_mode)
-    results: Dict[str, float] = {}
+    scored_meta = get_new_values(summarized_meta, thresholds=thresholds, score_mode=score_mode)
+    results: dict[str, float] = {}
 
     if len(dataset_name_list) != len(dataset_list):
         warnings.warn(
-        "dataset_name_list and dataset_list lengths differ; "
-        "ignoring extras (zip behavior).",
-        UserWarning,
-        stacklevel=2
-)   
+            "dataset_name_list and dataset_list lengths differ; ignoring extras (zip behavior).",
+            UserWarning,
+            stacklevel=2,
+        )
 
-    weights = get_weights(given_weights, summarized_meta)
+    base_weights = get_weights(given_weights, summarized_meta)
+    weight_map = dict(zip(metrics, base_weights))
 
     for ds_name, df in zip(dataset_name_list, dataset_list):
         per_column_scores = []
         df = pd.DataFrame(df)
 
+        if len(df) == 0:
+            results[ds_name] = 0.0
+            continue
+
         for col in df.columns:
-            col_score = 0.0
+            key_match = (
+                (scored_meta["dataset_name"] == ds_name) &
+                (scored_meta["column_name"] == col)
+            )
+            col_rows = scored_meta[key_match]
 
-            for j, metric in enumerate(metrics):
-                key_match = (
-                    (scored_meta["dataset_name"] == ds_name) &
-                    (scored_meta["column_name"] == col)
-                )
-                matched = scored_meta.loc[key_match, metric].values
-                score = float(matched[0]) if len(matched) > 0 and not pd.isna(matched[0]) else 1.0
-                col_score += score * weights[j]
+            applicable_scores = []
+            applicable_weights = []
 
-            per_column_scores.append(col_score)
+            for metric in metrics:
+                if col_rows.empty:
+                    continue
+                val = col_rows[metric].iloc[0]
+                if pd.notna(val):
+                    applicable_scores.append(float(val))
+                    applicable_weights.append(weight_map.get(metric, 1.0))
+
+            if applicable_scores:
+                tot_w = sum(applicable_weights)
+                col_score = sum(s * (w / tot_w) for s, w in zip(applicable_scores, applicable_weights))
+                per_column_scores.append(col_score)
+            else:
+                per_column_scores.append(1.0)
 
         avg_score = float(np.mean(per_column_scores)) * 100.0 if per_column_scores else 0.0
-        results[ds_name] = avg_score
+        results[ds_name] = round(avg_score, 2)
 
     return results
