@@ -75,10 +75,10 @@ DEFAULT_DIMENSION_WEIGHTS: Dict[QualityDimension, float] = {
 DEFAULT_METRIC_WEIGHTS: Dict[str, float] = {
     "completeness_cell": 0.70,
     "completeness_row": 0.30,
-    "validity_type_errors": 0.40,
+    "validity_type_errors": 0.30,
     "validity_whitespace": 0.20,
-    "validity_rules": 0.40,
-    "validity_outliers": 0.30,
+    "validity_rules": 0.30,
+    "validity_outliers": 0.20,
     "uniqueness_duplicate_rows": 0.50,
     "uniqueness_identifiers": 0.50,
     "consistency_rules": 1.00,
@@ -259,15 +259,23 @@ def _evaluate_consistency_rules(
         try:
             res = cond_fn(df)
             if isinstance(res, (pd.Series, np.ndarray, list)):
-                res_arr = np.asarray(res, dtype=bool)
-                valid_count = int(np.sum(res_arr))
-                violation_count = max(0, total_rows - valid_count)
+                s = pd.Series(res)
+                non_na = s.notna()
+                eligible_rows = int(non_na.sum())
+                if eligible_rows == 0:
+                    violation_count = 0
+                    violation_pct = 0.0
+                else:
+                    valid_mask = s[non_na].astype(bool)
+                    violation_count = int((~valid_mask).sum())
+                    violation_pct = (violation_count / eligible_rows) * 100.0
             elif isinstance(res, (bool, np.bool_)):
                 violation_count = 0 if bool(res) else total_rows
+                violation_pct = 0.0 if bool(res) else 100.0
             else:
                 violation_count = 0
+                violation_pct = 0.0
 
-            violation_pct = (violation_count / total_rows) * 100.0
             r_score = calculate_metric_score(violation_pct, rule_threshold, score_mode=score_mode)
             rule_scores.append(r_score)
             rule_details[name] = {
@@ -286,7 +294,13 @@ def _evaluate_consistency_rules(
             }
 
     mean_score = float(np.mean(rule_scores)) if rule_scores else 1.0
-    return mean_score, {"evaluated_rules": len(rule_scores), "rule_details": rule_details}
+    viol_pcts = [d["violation_percent"] for d in rule_details.values() if "violation_percent" in d]
+    mean_viol = float(np.mean(viol_pcts)) if viol_pcts else 0.0
+    return mean_score, {
+        "evaluated_rules": len(rule_scores),
+        "rule_details": rule_details,
+        "mean_violation_percent": round(mean_viol, 4),
+    }
 
 
 def _evaluate_timeliness(
@@ -361,6 +375,12 @@ def _evaluate_timeliness(
         w_fresh, w_future, w_seq = w_fresh / tot_w, w_future / tot_w, w_seq / tot_w
 
     col_scores: List[float] = []
+    fresh_scores: List[float] = []
+    future_scores: List[float] = []
+    seq_scores: List[float] = []
+    fresh_days_list: List[float] = []
+    fut_pct_list: List[float] = []
+    parse_rate_list: List[float] = []
     all_metrics: Dict[str, float] = {}
     metric_subscores: Dict[str, float] = {}
     col_details: Dict[str, Any] = {}
@@ -394,6 +414,12 @@ def _evaluate_timeliness(
 
         col_score = (w_fresh * s_fresh + w_future * s_future + w_seq * s_seq) * 100.0
         col_scores.append(col_score)
+        fresh_scores.append(s_fresh)
+        future_scores.append(s_future)
+        seq_scores.append(s_seq)
+        fresh_days_list.append(actual_fresh)
+        fut_pct_list.append(fut_pct)
+        parse_rate_list.append(parse_rate)
 
         all_metrics[f"{c}_freshness_days"] = actual_fresh
         all_metrics[f"{c}_future_dates_percent"] = fut_pct
@@ -406,6 +432,9 @@ def _evaluate_timeliness(
             "parse_rate": round(parse_rate, 4),
             "is_monotonic_increasing": t_res.get("is_monotonic_increasing", False),
             "score": round(col_score, 2),
+            "freshness_score": round(s_fresh * 100.0, 2),
+            "future_dates_score": round(s_future * 100.0, 2),
+            "sequence_score": round(s_seq * 100.0, 2),
         }
 
     if not col_scores:
@@ -419,9 +448,13 @@ def _evaluate_timeliness(
         )
 
     timeliness_score = float(np.mean(col_scores))
-    metric_subscores["freshness_score"] = round(s_fresh * 100.0, 2)
-    metric_subscores["future_dates_score"] = round(s_future * 100.0, 2)
-    metric_subscores["sequence_score"] = round(s_seq * 100.0, 2)
+    metric_subscores["freshness_score"] = round(float(np.mean(fresh_scores)) * 100.0, 2)
+    metric_subscores["future_dates_score"] = round(float(np.mean(future_scores)) * 100.0, 2)
+    metric_subscores["sequence_score"] = round(float(np.mean(seq_scores)) * 100.0, 2)
+
+    all_metrics["freshness_days"] = float(np.mean(fresh_days_list)) if fresh_days_list else 0.0
+    all_metrics["future_dates_percent"] = float(np.mean(fut_pct_list)) if fut_pct_list else 0.0
+    all_metrics["parse_rate"] = float(np.mean(parse_rate_list)) if parse_rate_list else 1.0
 
     return (
         True,
@@ -486,11 +519,22 @@ def score_dataset(
             for dim in QualityDimension
         }
         if return_details:
-            return 0.0, empty_dims, {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "Empty dataset"
+            empty_sm = pd.DataFrame()
+            empty_sm.index.name = "column_name"
+            return 0.0, empty_dims, {}, empty_sm, pd.DataFrame(), pd.DataFrame(), "Empty dataset"
         return 0.0, empty_dims, {}
 
     col_scores_collector: Dict[str, List[Tuple[float, float]]] = {col: [] for col in df.columns}
-    per_col_subscores: Dict[str, Dict[str, float]] = {col: {} for col in df.columns}
+    per_col_subscores: Dict[str, Dict[str, float]] = {
+        col: {
+            "completeness_score": np.nan,
+            "validity_score": np.nan,
+            "uniqueness_score": np.nan,
+            "timeliness_score": np.nan,
+            "stability_score": np.nan,
+        }
+        for col in df.columns
+    }
 
     # =========================================================================
     # 1. COMPLETENESS DIMENSION (cell completeness + row completeness)
@@ -498,6 +542,7 @@ def score_dataset(
     comp_col_scores = []
     total_missing_cells = 0
     total_cells = total_rows * max(1, len(df.columns))
+    w_comp_dim = configured_dim_weights[QualityDimension.COMPLETENESS]
 
     for _, row in meta_df.iterrows():
         col = row.get("column_name")
@@ -513,7 +558,8 @@ def score_dataset(
             miss_pct, thresholds.get("missing_percent", 20.0), score_mode=score_mode
         )
         comp_col_scores.append(m_score)
-        col_scores_collector[col].append((m_score, 1.0))
+        if w_comp_dim > 0:
+            col_scores_collector[col].append((m_score, w_comp_dim))
         per_col_subscores[col]["completeness_score"] = round(m_score * 100.0, 2)
 
     avg_cell_missing_pct = (total_missing_cells / total_cells) * 100.0 if total_cells > 0 else 0.0
@@ -557,10 +603,11 @@ def score_dataset(
     # 2. VALIDITY DIMENSION (type errors, whitespace, custom business rules, outliers)
     # =========================================================================
     validity_column_scores = []
-    w_v_type = metric_weights.get("validity_type_errors", 0.40)
+    w_v_type = metric_weights.get("validity_type_errors", 0.30)
     w_v_ws = metric_weights.get("validity_whitespace", 0.20)
-    w_v_rule = metric_weights.get("validity_rules", 0.40)
-    w_v_out = metric_weights.get("validity_outliers", 0.30)
+    w_v_rule = metric_weights.get("validity_rules", 0.30)
+    w_v_out = metric_weights.get("validity_outliers", 0.20)
+    w_v_dim = configured_dim_weights[QualityDimension.VALIDITY]
 
     for _, row in meta_df.iterrows():
         col = row.get("column_name")
@@ -568,8 +615,17 @@ def score_dataset(
             continue
 
         role = str(row.get("column_role", "unknown"))
-        n_vals = int(row.get("non_null_count", 0)) + int(row.get("missing_count", 0))
-        n_safe = max(1, n_vals)
+        n_non_null = int(row.get("non_null_count", 0))
+        if n_non_null == 0:
+            # When a column contains zero non-null values, Validity cannot be observed on present data.
+            per_col_subscores[col]["validity_score"] = np.nan
+            per_col_subscores[col]["type_score"] = np.nan
+            per_col_subscores[col]["whitespace_score"] = np.nan
+            per_col_subscores[col]["rule_score"] = np.nan
+            per_col_subscores[col]["outlier_score"] = np.nan
+            continue
+
+        n_safe = max(1, n_non_null)
 
         val_metric_scores = []
         val_metric_weights = []
@@ -582,7 +638,7 @@ def score_dataset(
         # Type errors
         type_err = row.get("type_errors", 0)
         if pd.notna(type_err):
-            type_pct = (float(type_err) / n_safe) * 100.0
+            type_pct = (float(type_err) / n_safe) * 100.0 if n_non_null > 0 else 0.0
             t_score = calculate_metric_score(
                 type_pct, thresholds.get("type_errors_percent", 2.0), score_mode=score_mode
             )
@@ -594,7 +650,7 @@ def score_dataset(
         if role in {"categorical", "free_text", "identifier"}:
             ws_err = row.get("whitespace_issues", 0)
             if pd.notna(ws_err):
-                ws_pct = (float(ws_err) / n_safe) * 100.0
+                ws_pct = (float(ws_err) / n_safe) * 100.0 if n_non_null > 0 else 0.0
                 w_score = calculate_metric_score(
                     ws_pct, thresholds.get("whitespace_percent", 5.0), score_mode=score_mode
                 )
@@ -605,7 +661,7 @@ def score_dataset(
         # Rules
         rule_err = row.get("rule_errors", 0)
         if pd.notna(rule_err) and config.rules and col in config.rules:
-            rule_pct = (float(rule_err) / n_safe) * 100.0
+            rule_pct = (float(rule_err) / n_safe) * 100.0 if n_non_null > 0 else 0.0
             r_score = calculate_metric_score(
                 rule_pct, thresholds.get("rule_errors_percent", 2.0), score_mode=score_mode
             )
@@ -615,10 +671,9 @@ def score_dataset(
 
         # Outlier plausibility (continuous / discrete numeric columns)
         if role in {"continuous", "discrete"}:
-            n_non_null = int(row.get("non_null_count", 0))
             if n_non_null >= 3:
                 out_cnt = row.get("outlier_count", 0)
-                out_pct = (float(out_cnt or 0) / max(1, n_non_null)) * 100.0
+                out_pct = (float(out_cnt or 0) / n_safe) * 100.0
                 o_score = calculate_metric_score(
                     out_pct, thresholds.get("outlier_percent", 10.0), score_mode=score_mode
                 )
@@ -630,25 +685,36 @@ def score_dataset(
             sub_w_tot = sum(val_metric_weights)
             col_val_score = sum(s * (w / sub_w_tot) for s, w in zip(val_metric_scores, val_metric_weights))
             validity_column_scores.append(col_val_score)
-            col_scores_collector[col].append((col_val_score, 1.0))
+            if w_v_dim > 0:
+                col_scores_collector[col].append((col_val_score, w_v_dim))
             per_col_subscores[col]["validity_score"] = round(col_val_score * 100.0, 2)
         else:
             per_col_subscores[col]["validity_score"] = 100.0
+            if w_v_dim > 0:
+                col_scores_collector[col].append((1.0, w_v_dim))
 
         per_col_subscores[col]["type_score"] = t_score_val
         per_col_subscores[col]["whitespace_score"] = w_score_val
         per_col_subscores[col]["rule_score"] = r_score_val
         per_col_subscores[col]["outlier_score"] = o_score_val
 
-    validity_score = float(np.mean(validity_column_scores) * 100.0) if validity_column_scores else 100.0
+    if validity_column_scores:
+        validity_score = float(np.mean(validity_column_scores) * 100.0)
+        validity_applicable = True
+        validity_reason = None
+    else:
+        validity_score = 0.0
+        validity_applicable = False
+        validity_reason = "No non-null values present in dataset to evaluate validity"
 
     validity_dim = DimensionScore(
         dimension=QualityDimension.VALIDITY,
         score=round(validity_score, 2),
         configured_weight=configured_dim_weights[QualityDimension.VALIDITY],
-        applicable=True,
-        metrics={"average_validity": round(validity_score, 2)},
-        metric_scores={"column_validity_score": round(validity_score, 2)},
+        applicable=validity_applicable,
+        reason=validity_reason,
+        metrics={"average_validity": round(validity_score, 2) if validity_applicable else 0.0},
+        metric_scores={"column_validity_score": round(validity_score, 2) if validity_applicable else 0.0},
     )
 
     # =========================================================================
@@ -682,6 +748,17 @@ def score_dataset(
             w_u_rows, w_u_ids = w_u_rows / tot_u_w, w_u_ids / tot_u_w
         uniqueness_score = (w_u_rows * dup_row_score + w_u_ids * id_score) * 100.0
         id_score_val = round(id_score * 100.0, 2)
+
+        # Record per-column identifier uniqueness scores
+        w_u_dim = configured_dim_weights[QualityDimension.UNIQUENESS]
+        col_metrics = id_res.get("column_metrics", {})
+        for c, c_info in col_metrics.items():
+            if c in col_scores_collector:
+                c_dup_pct = float(c_info.get("duplicate_percent", 0.0))
+                c_id_score = calculate_metric_score(c_dup_pct, dup_thresh, score_mode=score_mode)
+                if w_u_dim > 0:
+                    col_scores_collector[c].append((c_id_score, w_u_dim))
+                per_col_subscores[c]["uniqueness_score"] = round(c_id_score * 100.0, 2)
     else:
         uniqueness_score = dup_row_score * 100.0
         id_score_val = 100.0
@@ -699,7 +776,7 @@ def score_dataset(
             "duplicate_rows_score": round(dup_row_score * 100.0, 2),
             "identifier_uniqueness_score": id_score_val,
         },
-        details={"identifier_columns": id_res.get("identifier_columns", [])},
+        details={"identifier_columns": id_res.get("identifier_columns", []), "has_identifiers": has_ids},
     )
 
     # =========================================================================
@@ -718,6 +795,7 @@ def score_dataset(
             score_mode=score_mode,
         )
         consistency_subscores["cross_column_rules_score"] = round(rule_score_val * 100.0, 2)
+        consistency_metrics["rule_violation_percent"] = round(float(rule_eval_details.get("mean_violation_percent", 0.0)), 4)
         consistency_score = rule_score_val * 100.0
         consistency_applicable = True
         consistency_reason = None
@@ -768,6 +846,15 @@ def score_dataset(
         details=time_details,
     )
 
+    w_t_dim = configured_dim_weights[QualityDimension.TIMELINESS]
+    if time_applicable and isinstance(time_details, dict) and "columns" in time_details:
+        for c, c_info in time_details["columns"].items():
+            if c in col_scores_collector:
+                c_score = float(c_info.get("score", 100.0)) / 100.0
+                if w_t_dim > 0:
+                    col_scores_collector[c].append((c_score, w_t_dim))
+                per_col_subscores[c]["timeliness_score"] = round(float(c_info.get("score", 100.0)), 2)
+
     # =========================================================================
     # 6. STABILITY DIMENSION (PSI, JSD, KS drift against baseline)
     # =========================================================================
@@ -795,14 +882,16 @@ def score_dataset(
 
             if pd.notna(psi_val) and pd.notna(js_val):
                 p_score = calculate_metric_score(
-                    float(psi_val), thresholds.get("psi_divergence", 0.25), score_mode=score_mode, k=3.0
+                    float(psi_val), thresholds.get("psi_divergence", 0.25), score_mode=score_mode, k=2.0
                 )
                 j_score = calculate_metric_score(
-                    float(js_val), thresholds.get("js_divergence", 0.10), score_mode=score_mode, k=3.0
+                    float(js_val), thresholds.get("js_divergence", 0.10), score_mode=score_mode, k=2.0
                 )
                 drift_score = w_s_psi * p_score + w_s_jsd * j_score
                 stability_scores.append(drift_score)
-                col_scores_collector[col].append((drift_score, 1.0))
+                w_s_dim = configured_dim_weights[QualityDimension.STABILITY]
+                if w_s_dim > 0:
+                    col_scores_collector[col].append((drift_score, w_s_dim))
                 stability_metrics[f"{col}_psi"] = float(psi_val)
                 stability_metrics[f"{col}_jsd"] = float(js_val)
                 per_col_subscores[col]["stability_score"] = round(drift_score * 100.0, 2)
@@ -877,8 +966,11 @@ def score_dataset(
             final_col_scores[col] = 100.0
         else:
             tot_w = sum(w for _, w in pairs)
-            weighted_s = sum(s * w for s, w in pairs)
-            final_col_scores[col] = round((weighted_s / tot_w) * 100.0, 2)
+            if tot_w > 0:
+                weighted_s = sum(s * w for s, w in pairs)
+                final_col_scores[col] = round((weighted_s / tot_w) * 100.0, 2)
+            else:
+                final_col_scores[col] = 100.0
 
     for col in df.columns:
         per_col_subscores[col]["overall_column_score"] = final_col_scores.get(col, 100.0)
@@ -902,13 +994,17 @@ def score_dataset(
             "whitespace_score": sc.get("whitespace_score", np.nan),
             "rule_score": sc.get("rule_score", np.nan),
             "outlier_score": sc.get("outlier_score", np.nan),
+            "uniqueness_score": sc.get("uniqueness_score", np.nan),
             "duplicate_rows_score": np.nan,   # Dataset-level metric: strictly NaN at column level
+            "timeliness_score": sc.get("timeliness_score", np.nan),
             "stability_score": sc.get("stability_score", np.nan),
             "overall_column_score": sc.get("overall_column_score", 100.0),
         })
     scoring_matrix_df = pd.DataFrame(scoring_rows)
     if not scoring_matrix_df.empty:
         scoring_matrix_df.set_index("column_name", inplace=True)
+    else:
+        scoring_matrix_df.index.name = "column_name"
 
     # 2. Dimension Summary DataFrame with Hare-Niemeyer display reconciliation
     disp_weights: Dict[str, float] = {}
@@ -1053,12 +1149,17 @@ def build_metric_inventory(
     stab_ds = dimension_scores.get(QualityDimension.STABILITY.value)
 
     # 1. COMPLETENESS METRICS
-    # Dataset-level row completeness
+    eff_w_comp = comp_ds.effective_weight if comp_ds and comp_ds.applicable else 0.0
+    w_c_cell = metric_weights.get("completeness_cell", 0.70)
+    w_c_row = metric_weights.get("completeness_row", 0.30)
+    tot_c_w = w_c_cell + w_c_row
+    if tot_c_w > 0:
+        w_c_cell, w_c_row = w_c_cell / tot_c_w, w_c_row / tot_c_w
+
     incomp_pct = comp_ds.metrics.get("incomplete_rows_percent") if comp_ds else 0.0
     row_score = comp_ds.metric_scores.get("row_completeness_score") if comp_ds else 100.0
     r_thresh = thresholds.get("missing_percent", 20.0)
-    w_row = metric_weights.get("completeness_row", 0.30)
-    eff_w_comp = comp_ds.effective_weight if comp_ds and comp_ds.applicable else 0.0
+
     rows.append({
         "dimension": QualityDimension.COMPLETENESS.value,
         "metric_name": "completeness_row",
@@ -1071,13 +1172,13 @@ def build_metric_inventory(
         "status": "PASS" if (incomp_pct or 0) <= r_thresh else "WARNING",
         "metric_score": row_score,
         "contributes_to_score": True,
-        "effective_weight": round(w_row * eff_w_comp, 4),
+        "effective_weight": round(w_c_row * eff_w_comp, 4),
         "calculation_method": "Percentage of rows containing at least 1 null",
         "reason": None,
     })
 
     # Column-level cell missingness
-    w_cell = metric_weights.get("completeness_cell", 0.70)
+    n_meta = max(1, len(meta_df))
     for _, meta_row in meta_df.iterrows():
         col = meta_row.get("column_name")
         m_pct = meta_row.get("missing_percent", 0.0)
@@ -1094,7 +1195,7 @@ def build_metric_inventory(
             "status": "PASS" if (m_pct or 0) <= r_thresh else ("CRITICAL" if (m_pct or 0) > 2 * r_thresh else "WARNING"),
             "metric_score": round(m_score, 2),
             "contributes_to_score": True,
-            "effective_weight": round((w_cell / max(1, len(meta_df))) * eff_w_comp, 4),
+            "effective_weight": round((w_c_cell / n_meta) * eff_w_comp, 4),
             "calculation_method": "Column cell null percentage",
             "reason": None,
         })
@@ -1106,15 +1207,32 @@ def build_metric_inventory(
     rule_thresh = thresholds.get("rule_errors_percent", 2.0)
     out_thresh = thresholds.get("outlier_percent", 10.0)
 
+    w_v_type = metric_weights.get("validity_type_errors", 0.30)
+    w_v_ws = metric_weights.get("validity_whitespace", 0.20)
+    w_v_rule = metric_weights.get("validity_rules", 0.30)
+    w_v_out = metric_weights.get("validity_outliers", 0.20)
+
     for _, meta_row in meta_df.iterrows():
         col = meta_row.get("column_name")
         role = str(meta_row.get("column_role", "unknown"))
         non_null = int(meta_row.get("non_null_count", 0))
 
+        active_weights = [("type", w_v_type)]
+        if role in {"categorical", "free_text", "identifier"}:
+            active_weights.append(("ws", w_v_ws))
+        if config.rules and col in config.rules:
+            active_weights.append(("rule", w_v_rule))
+        if role in {"continuous", "discrete"} and non_null >= 3:
+            active_weights.append(("out", w_v_out))
+
+        tot_act_w = sum(w for _, w in active_weights)
+        col_eff_base = eff_w_val / n_meta
+
         # Type errors
         t_err = meta_row.get("type_errors", 0)
-        t_pct = (float(t_err or 0) / max(1, non_null)) * 100.0
+        t_pct = (float(t_err or 0) / max(1, non_null)) * 100.0 if non_null > 0 else 0.0
         t_score = calculate_metric_score(t_pct, t_thresh, score_mode=config.score_mode) * 100.0
+        norm_w_type = (w_v_type / tot_act_w) if tot_act_w > 0 else 0.0
         rows.append({
             "dimension": QualityDimension.VALIDITY.value,
             "metric_name": "validity_type_errors",
@@ -1127,7 +1245,7 @@ def build_metric_inventory(
             "status": "PASS" if t_pct <= t_thresh else "WARNING",
             "metric_score": round(t_score, 2),
             "contributes_to_score": True,
-            "effective_weight": None,
+            "effective_weight": round(col_eff_base * norm_w_type, 4),
             "calculation_method": "Semantic type conformance errors",
             "reason": None,
         })
@@ -1135,8 +1253,9 @@ def build_metric_inventory(
         # Whitespace
         if role in {"categorical", "free_text", "identifier"}:
             ws_err = meta_row.get("whitespace_issues", 0)
-            ws_pct = (float(ws_err or 0) / max(1, non_null)) * 100.0
+            ws_pct = (float(ws_err or 0) / max(1, non_null)) * 100.0 if non_null > 0 else 0.0
             w_score = calculate_metric_score(ws_pct, ws_thresh, score_mode=config.score_mode) * 100.0
+            norm_w_ws = (w_v_ws / tot_act_w) if tot_act_w > 0 else 0.0
             rows.append({
                 "dimension": QualityDimension.VALIDITY.value,
                 "metric_name": "validity_whitespace",
@@ -1149,37 +1268,74 @@ def build_metric_inventory(
                 "status": "PASS" if ws_pct <= ws_thresh else "WARNING",
                 "metric_score": round(w_score, 2),
                 "contributes_to_score": True,
-                "effective_weight": None,
+                "effective_weight": round(col_eff_base * norm_w_ws, 4),
                 "calculation_method": "Untrimmed leading/trailing whitespace",
+                "reason": None,
+            })
+
+        # Rules
+        if config.rules and col in config.rules:
+            r_err = meta_row.get("rule_errors", 0)
+            r_pct = (float(r_err or 0) / max(1, non_null)) * 100.0 if non_null > 0 else 0.0
+            r_score = calculate_metric_score(r_pct, rule_thresh, score_mode=config.score_mode) * 100.0
+            norm_w_rule = (w_v_rule / tot_act_w) if tot_act_w > 0 else 0.0
+            rows.append({
+                "dimension": QualityDimension.VALIDITY.value,
+                "metric_name": "validity_rules",
+                "domain": "validity",
+                "scope": "column",
+                "target_column": col,
+                "raw_value": round(r_pct, 2),
+                "unit": "%",
+                "threshold": rule_thresh,
+                "status": "PASS" if r_pct <= rule_thresh else "WARNING",
+                "metric_score": round(r_score, 2),
+                "contributes_to_score": True,
+                "effective_weight": round(col_eff_base * norm_w_rule, 4),
+                "calculation_method": "User-defined domain business rule validation",
                 "reason": None,
             })
 
         # Outliers
         if role in {"continuous", "discrete"}:
-            out_cnt = meta_row.get("outlier_count", 0)
-            out_pct = (float(out_cnt or 0) / max(1, non_null)) * 100.0
-            o_score = calculate_metric_score(out_pct, out_thresh, score_mode=config.score_mode) * 100.0
-            rows.append({
-                "dimension": QualityDimension.VALIDITY.value,
-                "metric_name": "validity_outliers",
-                "domain": "validity",
-                "scope": "column",
-                "target_column": col,
-                "raw_value": round(out_pct, 2),
-                "unit": "%",
-                "threshold": out_thresh,
-                "status": "PASS" if out_pct <= out_thresh else "WARNING",
-                "metric_score": round(o_score, 2),
-                "contributes_to_score": True,
-                "effective_weight": None,
-                "calculation_method": "Heuristic statistical outlier containment",
-                "reason": None,
-            })
+            if non_null >= 3:
+                out_cnt = meta_row.get("outlier_count", 0)
+                out_pct = (float(out_cnt or 0) / max(1, non_null)) * 100.0
+                o_score = calculate_metric_score(out_pct, out_thresh, score_mode=config.score_mode) * 100.0
+                norm_w_out = (w_v_out / tot_act_w) if tot_act_w > 0 else 0.0
+                rows.append({
+                    "dimension": QualityDimension.VALIDITY.value,
+                    "metric_name": "validity_outliers",
+                    "domain": "validity",
+                    "scope": "column",
+                    "target_column": col,
+                    "raw_value": round(out_pct, 2),
+                    "unit": "%",
+                    "threshold": out_thresh,
+                    "status": "PASS" if out_pct <= out_thresh else "WARNING",
+                    "metric_score": round(o_score, 2),
+                    "contributes_to_score": True,
+                    "effective_weight": round(col_eff_base * norm_w_out, 4),
+                    "calculation_method": "Heuristic statistical outlier containment",
+                    "reason": None,
+                })
 
     # 3. UNIQUENESS METRICS
     eff_w_uniq = uniq_ds.effective_weight if uniq_ds and uniq_ds.applicable else 0.0
     dup_row_pct = uniq_ds.metrics.get("duplicate_rows_percent", 0.0) if uniq_ds else 0.0
     dup_thresh = thresholds.get("duplicate_rows_percent", 1.0)
+
+    w_u_rows = metric_weights.get("uniqueness_duplicate_rows", 0.50)
+    w_u_ids = metric_weights.get("uniqueness_identifiers", 0.50)
+    has_ids = uniq_ds.details.get("has_identifiers", False) if (uniq_ds and isinstance(uniq_ds.details, dict)) else False
+    if has_ids:
+        tot_u_w = w_u_rows + w_u_ids
+        if tot_u_w > 0:
+            w_u_rows, w_u_ids = w_u_rows / tot_u_w, w_u_ids / tot_u_w
+    else:
+        w_u_rows = 1.0
+        w_u_ids = 0.0
+
     rows.append({
         "dimension": QualityDimension.UNIQUENESS.value,
         "metric_name": "uniqueness_duplicate_rows",
@@ -1192,24 +1348,62 @@ def build_metric_inventory(
         "status": "PASS" if dup_row_pct <= dup_thresh else "WARNING",
         "metric_score": uniq_ds.metric_scores.get("duplicate_rows_score", 100.0) if uniq_ds else 100.0,
         "contributes_to_score": True,
-        "effective_weight": round(eff_w_uniq * 0.50, 4),
+        "effective_weight": round(eff_w_uniq * w_u_rows, 4),
         "calculation_method": "Duplicate rows percentage",
         "reason": None,
     })
 
+    if has_ids:
+        id_pct = uniq_ds.metrics.get("identifier_duplicate_percent", 0.0) if uniq_ds else 0.0
+        id_cols = uniq_ds.details.get("identifier_columns", []) if (uniq_ds and isinstance(uniq_ds.details, dict)) else []
+        rows.append({
+            "dimension": QualityDimension.UNIQUENESS.value,
+            "metric_name": "uniqueness_identifiers",
+            "domain": "uniqueness",
+            "scope": "column" if len(id_cols) == 1 else "dataset",
+            "target_column": id_cols[0] if len(id_cols) == 1 else (", ".join(id_cols) if id_cols else None),
+            "raw_value": round(float(id_pct), 2),
+            "unit": "%",
+            "threshold": dup_thresh,
+            "status": "PASS" if id_pct <= dup_thresh else "WARNING",
+            "metric_score": uniq_ds.metric_scores.get("identifier_uniqueness_score", 100.0) if uniq_ds else 100.0,
+            "contributes_to_score": True,
+            "effective_weight": round(eff_w_uniq * w_u_ids, 4),
+            "calculation_method": "Primary identifier duplicate key detection",
+            "reason": None,
+        })
+    else:
+        rows.append({
+            "dimension": QualityDimension.UNIQUENESS.value,
+            "metric_name": "uniqueness_identifiers",
+            "domain": "uniqueness",
+            "scope": "dataset",
+            "target_column": None,
+            "raw_value": None,
+            "unit": "%",
+            "threshold": dup_thresh,
+            "status": "NOT_APPLICABLE",
+            "metric_score": None,
+            "contributes_to_score": False,
+            "effective_weight": 0.0,
+            "calculation_method": "Primary identifier duplicate key detection",
+            "reason": "No identifier columns detected or configured",
+        })
+
     # 4. CONSISTENCY METRICS
     eff_w_cons = cons_ds.effective_weight if cons_ds and cons_ds.applicable else 0.0
     if cons_ds and cons_ds.applicable:
+        viol_pct = float(cons_ds.metrics.get("rule_violation_percent", 0.0))
         rows.append({
             "dimension": QualityDimension.CONSISTENCY.value,
             "metric_name": "consistency_rules",
             "domain": "consistency",
             "scope": "dataset",
             "target_column": None,
-            "raw_value": cons_ds.score,
-            "unit": "score [0-100]",
+            "raw_value": round(viol_pct, 2),
+            "unit": "%",
             "threshold": rule_thresh,
-            "status": "PASS" if cons_ds.score >= 90.0 else "WARNING",
+            "status": "PASS" if viol_pct <= rule_thresh else "WARNING",
             "metric_score": cons_ds.score,
             "contributes_to_score": True,
             "effective_weight": round(eff_w_cons, 4),
@@ -1236,68 +1430,156 @@ def build_metric_inventory(
 
     # 5. TIMELINESS METRICS
     eff_w_time = time_ds.effective_weight if time_ds and time_ds.applicable else 0.0
-    if time_ds and time_ds.applicable:
-        fresh_days = time_ds.metrics.get("freshness_days")
-        fut_pct = time_ds.metrics.get("future_dates_percent", 0.0)
-        rows.append({
-            "dimension": QualityDimension.TIMELINESS.value,
-            "metric_name": "timeliness_freshness",
-            "domain": "timeliness",
-            "scope": "column",
-            "target_column": None,
-            "raw_value": round(float(fresh_days), 2) if fresh_days is not None else None,
-            "unit": "days",
-            "threshold": thresholds.get("freshness_days", 30.0),
-            "status": "PASS" if (fresh_days or 0) <= thresholds.get("freshness_days", 30.0) else "WARNING",
-            "metric_score": time_ds.metric_scores.get("freshness_score", 100.0),
-            "contributes_to_score": True,
-            "effective_weight": round(eff_w_time * 0.50, 4),
-            "calculation_method": "Elapsed days between max timestamp and reference time",
-            "reason": None,
-        })
+    w_t_fresh = metric_weights.get("timeliness_freshness", 0.50)
+    w_t_future = metric_weights.get("timeliness_future_dates", 0.30)
+    w_t_seq = metric_weights.get("timeliness_sequence", 0.20)
+    tot_t_w = w_t_fresh + w_t_future + w_t_seq
+    if tot_t_w > 0:
+        w_t_fresh, w_t_future, w_t_seq = w_t_fresh / tot_t_w, w_t_future / tot_t_w, w_t_seq / tot_t_w
+
+    fresh_thresh = thresholds.get("freshness_days", 30.0)
+    future_thresh = thresholds.get("future_dates_percent", 0.1)
+
+    if time_ds and time_ds.applicable and time_ds.details and "columns" in time_ds.details and time_ds.details["columns"]:
+        col_items = time_ds.details["columns"]
+        n_dt_cols = max(1, len(col_items))
+        for col_name, c_info in col_items.items():
+            col_eff_w = eff_w_time / n_dt_cols
+            f_days = c_info.get("freshness_days", 0.0)
+            f_score = c_info.get("freshness_score", 100.0)
+            rows.append({
+                "dimension": QualityDimension.TIMELINESS.value,
+                "metric_name": "timeliness_freshness",
+                "domain": "timeliness",
+                "scope": "column",
+                "target_column": col_name,
+                "raw_value": round(float(f_days), 2),
+                "unit": "days",
+                "threshold": fresh_thresh,
+                "status": "PASS" if f_days <= fresh_thresh else "WARNING",
+                "metric_score": round(float(f_score), 2),
+                "contributes_to_score": True,
+                "effective_weight": round(col_eff_w * w_t_fresh, 4),
+                "calculation_method": "Elapsed days between max timestamp and reference time",
+                "reason": None,
+            })
+
+            fut_pct = c_info.get("future_dates_percent", 0.0)
+            fut_score = c_info.get("future_dates_score", 100.0)
+            rows.append({
+                "dimension": QualityDimension.TIMELINESS.value,
+                "metric_name": "timeliness_future_dates",
+                "domain": "timeliness",
+                "scope": "column",
+                "target_column": col_name,
+                "raw_value": round(float(fut_pct), 4),
+                "unit": "%",
+                "threshold": future_thresh,
+                "status": "PASS" if fut_pct <= future_thresh else "WARNING",
+                "metric_score": round(float(fut_score), 2),
+                "contributes_to_score": True,
+                "effective_weight": round(col_eff_w * w_t_future, 4),
+                "calculation_method": "Percentage of timestamps in future relative to reference time",
+                "reason": None,
+            })
+
+            pr = c_info.get("parse_rate", 1.0)
+            seq_score = c_info.get("sequence_score", 100.0)
+            rows.append({
+                "dimension": QualityDimension.TIMELINESS.value,
+                "metric_name": "timeliness_sequence",
+                "domain": "timeliness",
+                "scope": "column",
+                "target_column": col_name,
+                "raw_value": round(float(pr), 4),
+                "unit": "ratio [0, 1]",
+                "threshold": 1.0,
+                "status": "PASS" if pr >= 0.99 else "WARNING",
+                "metric_score": round(float(seq_score), 2),
+                "contributes_to_score": True,
+                "effective_weight": round(col_eff_w * w_t_seq, 4),
+                "calculation_method": "Temporal timestamp sequence parse rate and ordering",
+                "reason": None,
+            })
     else:
-        rows.append({
-            "dimension": QualityDimension.TIMELINESS.value,
-            "metric_name": "timeliness_freshness",
-            "domain": "timeliness",
-            "scope": "column",
-            "target_column": None,
-            "raw_value": None,
-            "unit": "days",
-            "threshold": thresholds.get("freshness_days", 30.0),
-            "status": "NOT_APPLICABLE",
-            "metric_score": None,
-            "contributes_to_score": False,
-            "effective_weight": 0.0,
-            "calculation_method": "Elapsed days between max timestamp and reference time",
-            "reason": time_ds.reason if time_ds else "No datetime columns detected",
-        })
+        for m_name, m_unit, m_thresh, m_method in [
+            ("timeliness_freshness", "days", fresh_thresh, "Elapsed days between max timestamp and reference time"),
+            ("timeliness_future_dates", "%", future_thresh, "Percentage of timestamps in future relative to reference time"),
+            ("timeliness_sequence", "ratio [0, 1]", 1.0, "Temporal timestamp sequence parse rate and ordering"),
+        ]:
+            rows.append({
+                "dimension": QualityDimension.TIMELINESS.value,
+                "metric_name": m_name,
+                "domain": "timeliness",
+                "scope": "column",
+                "target_column": None,
+                "raw_value": None,
+                "unit": m_unit,
+                "threshold": m_thresh,
+                "status": "NOT_APPLICABLE",
+                "metric_score": None,
+                "contributes_to_score": False,
+                "effective_weight": 0.0,
+                "calculation_method": m_method,
+                "reason": time_ds.reason if time_ds else "No datetime columns detected",
+            })
 
     # 6. STABILITY METRICS
     eff_w_stab = stab_ds.effective_weight if stab_ds and stab_ds.applicable else 0.0
+    w_s_psi = metric_weights.get("stability_psi", 0.50)
+    w_s_jsd = metric_weights.get("stability_jsd", 0.50)
+    tot_s_w = w_s_psi + w_s_jsd
+    if tot_s_w > 0:
+        w_s_psi, w_s_jsd = w_s_psi / tot_s_w, w_s_jsd / tot_s_w
+
+    p_thresh = thresholds.get("psi_divergence", 0.25)
+    j_thresh = thresholds.get("js_divergence", 0.10)
+
     if stab_ds and stab_ds.applicable:
-        for _, meta_row in meta_df.iterrows():
-            col = meta_row.get("column_name")
-            psi_val = meta_row.get("psi_divergence")
-            if pd.notna(psi_val):
-                p_thresh = thresholds.get("psi_divergence", 0.25)
-                p_score = calculate_metric_score(float(psi_val), p_thresh, score_mode=config.score_mode, k=3.0) * 100.0
-                rows.append({
-                    "dimension": QualityDimension.STABILITY.value,
-                    "metric_name": "stability_psi",
-                    "domain": "drift_analysis",
-                    "scope": "column",
-                    "target_column": col,
-                    "raw_value": round(float(psi_val), 4),
-                    "unit": "PSI",
-                    "threshold": p_thresh,
-                    "status": "PASS" if float(psi_val) < 0.10 else ("WARNING" if float(psi_val) < p_thresh else "CRITICAL"),
-                    "metric_score": round(p_score, 2),
-                    "contributes_to_score": True,
-                    "effective_weight": round(eff_w_stab * 0.50 / max(1, len(meta_df)), 4),
-                    "calculation_method": "Population Stability Index against reference baseline",
-                    "reason": None,
-                })
+        drift_rows = [
+            (col, meta_row.get("psi_divergence"), meta_row.get("js_divergence"))
+            for _, meta_row in meta_df.iterrows()
+            if pd.notna(meta_row.get("psi_divergence")) and pd.notna(meta_row.get("js_divergence"))
+            for col in [meta_row.get("column_name")]
+        ]
+        n_drift = max(1, len(drift_rows))
+        for col, psi_val, js_val in drift_rows:
+            col_eff_w = eff_w_stab / n_drift
+            p_score = calculate_metric_score(float(psi_val), p_thresh, score_mode=config.score_mode, k=2.0) * 100.0
+            rows.append({
+                "dimension": QualityDimension.STABILITY.value,
+                "metric_name": "stability_psi",
+                "domain": "drift_analysis",
+                "scope": "column",
+                "target_column": col,
+                "raw_value": round(float(psi_val), 4),
+                "unit": "PSI",
+                "threshold": p_thresh,
+                "status": "PASS" if float(psi_val) < 0.10 else ("WARNING" if float(psi_val) < p_thresh else "CRITICAL"),
+                "metric_score": round(p_score, 2),
+                "contributes_to_score": True,
+                "effective_weight": round(col_eff_w * w_s_psi, 4),
+                "calculation_method": "Population Stability Index against reference baseline",
+                "reason": None,
+            })
+
+            j_score = calculate_metric_score(float(js_val), j_thresh, score_mode=config.score_mode, k=2.0) * 100.0
+            rows.append({
+                "dimension": QualityDimension.STABILITY.value,
+                "metric_name": "stability_jsd",
+                "domain": "drift_analysis",
+                "scope": "column",
+                "target_column": col,
+                "raw_value": round(float(js_val), 4),
+                "unit": "JSD",
+                "threshold": j_thresh,
+                "status": "PASS" if float(js_val) < 0.05 else ("WARNING" if float(js_val) < j_thresh else "CRITICAL"),
+                "metric_score": round(j_score, 2),
+                "contributes_to_score": True,
+                "effective_weight": round(col_eff_w * w_s_jsd, 4),
+                "calculation_method": "Jensen-Shannon Divergence against reference baseline",
+                "reason": None,
+            })
     else:
         rows.append({
             "dimension": QualityDimension.STABILITY.value,
@@ -1307,7 +1589,7 @@ def build_metric_inventory(
             "target_column": None,
             "raw_value": None,
             "unit": "PSI",
-            "threshold": thresholds.get("psi_divergence", 0.25),
+            "threshold": p_thresh,
             "status": "NOT_APPLICABLE",
             "metric_score": None,
             "contributes_to_score": False,
@@ -1315,7 +1597,25 @@ def build_metric_inventory(
             "calculation_method": "Population Stability Index against reference baseline",
             "reason": stab_ds.reason if stab_ds else "No baseline reference dataset provided",
         })
+        rows.append({
+            "dimension": QualityDimension.STABILITY.value,
+            "metric_name": "stability_jsd",
+            "domain": "drift_analysis",
+            "scope": "column",
+            "target_column": None,
+            "raw_value": None,
+            "unit": "JSD",
+            "threshold": j_thresh,
+            "status": "NOT_APPLICABLE",
+            "metric_score": None,
+            "contributes_to_score": False,
+            "effective_weight": 0.0,
+            "calculation_method": "Jensen-Shannon Divergence against reference baseline",
+            "reason": stab_ds.reason if stab_ds else "No baseline reference dataset provided",
+        })
 
     inv_df = pd.DataFrame(rows)
+    if "target_column" in inv_df.columns and "column_name" not in inv_df.columns:
+        inv_df["column_name"] = inv_df["target_column"]
     return inv_df
 

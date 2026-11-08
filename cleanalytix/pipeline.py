@@ -77,6 +77,8 @@ def analyze(
     config: Optional[CleanalytixConfig] = None,
     rules: Optional[Rules] = None,
     level: AnalysisLevel = AnalysisLevel.STANDARD,
+    *,
+    baseline: Optional[pd.DataFrame] = None,
 ) -> CleanalytixResult:
     """Analyze a dataset and produce comprehensive Data Quality Intelligence.
 
@@ -99,22 +101,60 @@ def analyze(
         Structured analytical result with dimensional scores, insights, recommendations,
         and profiling metadata. Supports both object attribute access and dictionary key indexing.
     """
-    if config is None:
-        config = CleanalytixConfig()
+    if baseline_df is None and baseline is not None:
+        baseline_df = baseline
 
-    if rules is not None and config.rules is None:
-        config.rules = rules
+    if config is None:
+        config = CleanalytixConfig(rules=rules)
+    elif rules is not None:
+        from dataclasses import replace
+        config = replace(config, rules=rules)
 
     dataset_name = "dataset"
     has_baseline = baseline_df is not None
 
-    # Step 1: Generate metadata profiling
+    # Step 1: Generate metadata profiling & reference adjustments
     if has_baseline:
-        meta_df = generate_meta(
+        # 1a. Profile baseline independently
+        base_meta = generate_meta(
+            [dataset_name],
+            [baseline_df],
+            rules=config.rules,
+        )
+        base_score, _, _, _, _, _, _ = score_dataset(
+            baseline_df,
+            base_meta,
+            config=config,
+            has_baseline=False,
+            return_details=True,
+        )
+        base_health = summarize_dataset_health(base_meta)
+        base_metrics = get_table_for_DQ_computation(base_meta, [baseline_df], [dataset_name])
+        base_recs = cleaning_recommendations(base_meta)
+
+        base_data = _empty_base_block()
+        base_data.update({
+            "dirty_scores": pd.DataFrame([{"Dataset_name": dataset_name, "DQ_Score": base_score}]),
+            "meta_before_cleaning": base_meta,
+            "recommendations": base_recs,
+            "summarized_before": base_health,
+            "main_metrics_before": base_metrics,
+        })
+
+        # 1b. Learn reference profile from baseline and profile production with drift
+        ref_profile = learn_reference_profile([dataset_name], [baseline_df])
+        prod_meta_raw = generate_meta(
             [dataset_name],
             [baseline_df],
             new_dataset_list=[df],
             rules=config.rules,
+        )
+        meta_df = adjust_prod_meta_with_reference(
+            ref_profile,
+            base_meta,
+            prod_meta_raw,
+            [dataset_name],
+            [df],
         )
     else:
         meta_df = generate_meta(
@@ -122,6 +162,7 @@ def analyze(
             [df],
             rules=config.rules,
         )
+        base_data = None
 
     # Step 2: Scoring across Quality Dimensions with full audit ledger
     (
@@ -190,17 +231,17 @@ def analyze(
         "relationships": rel_info,
     }
 
-    base_data = _empty_base_block()
-    base_data.update({
-        "dirty_scores": pd.DataFrame([{"Dataset_name": dataset_name, "DQ_Score": overall_score}]),
-        "meta_before_cleaning": meta_df,
-        "recommendations": cleaning_recommendations(meta_df),
-        "summarized_before": health_summary,
-        "main_metrics_before": metrics_table,
-    })
-
-    prod_data = {}
-    if has_baseline:
+    if not has_baseline:
+        base_data = _empty_base_block()
+        base_data.update({
+            "dirty_scores": pd.DataFrame([{"Dataset_name": dataset_name, "DQ_Score": overall_score}]),
+            "meta_before_cleaning": meta_df,
+            "recommendations": cleaning_recommendations(meta_df),
+            "summarized_before": health_summary,
+            "main_metrics_before": metrics_table,
+        })
+        prod_data = {}
+    else:
         prod_data = _empty_base_block()
         prod_data.update({
             "dirty_scores": pd.DataFrame([{"Dataset_name": dataset_name, "DQ_Score": overall_score}]),

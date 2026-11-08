@@ -52,8 +52,14 @@ def get_table_for_DQ_computation(
     type_errors_percent = []
 
     for _, val in summarized_meta.iterrows():
-        n = table_lengths.get(val['dataset_name'], 1)
-        n_safe = max(1, n)
+        n_non_null = val.get('non_null_count')
+        if pd.notna(n_non_null):
+            n_safe = max(1, int(n_non_null))
+            has_present = int(n_non_null) > 0
+        else:
+            n = table_lengths.get(val['dataset_name'], 1)
+            n_safe = max(1, n)
+            has_present = True
 
         # Handle None / NaN gracefully without ZeroDivisionError
         out_cnt = val.get('outlier_count')
@@ -61,10 +67,10 @@ def get_table_for_DQ_computation(
         rule_cnt = val.get('rule_errors')
         type_cnt = val.get('type_errors')
 
-        outlier_percent.append((float(out_cnt) / n_safe * 100.0) if pd.notna(out_cnt) else np.nan)
-        whitespace_percent.append((float(ws_cnt) / n_safe * 100.0) if pd.notna(ws_cnt) else np.nan)
-        rule_errors_percent.append((float(rule_cnt) / n_safe * 100.0) if pd.notna(rule_cnt) else 0.0)
-        type_errors_percent.append((float(type_cnt) / n_safe * 100.0) if pd.notna(type_cnt) else 0.0)
+        outlier_percent.append((float(out_cnt) / n_safe * 100.0) if (pd.notna(out_cnt) and has_present) else (np.nan if pd.isna(out_cnt) else 0.0))
+        whitespace_percent.append((float(ws_cnt) / n_safe * 100.0) if (pd.notna(ws_cnt) and has_present) else (np.nan if pd.isna(ws_cnt) else 0.0))
+        rule_errors_percent.append((float(rule_cnt) / n_safe * 100.0) if (pd.notna(rule_cnt) and has_present) else 0.0)
+        type_errors_percent.append((float(type_cnt) / n_safe * 100.0) if (pd.notna(type_cnt) and has_present) else 0.0)
 
     summarized_meta['outlier_percent'] = outlier_percent
     summarized_meta['whitespace_percent'] = whitespace_percent

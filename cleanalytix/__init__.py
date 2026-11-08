@@ -44,6 +44,7 @@ from cleanalytix.adjust_prod_meta import learn_reference_profile, adjust_prod_me
 from cleanalytix.preprocess_types import infer_and_fix_types, diagnose_column_types
 from cleanalytix.types import (
     AnalysisLevel,
+    ColumnRole,
     QualityDimension,
     InsightSeverity,
     InsightItem,
@@ -53,6 +54,8 @@ from cleanalytix.types import (
     RelationshipProfile,
     CleanalytixConfig,
     CleanalytixResult,
+    ConsistencyRule,
+    TimelinessConfig,
     FeatureRetiredError,
     DQPipelineResult,
 )
@@ -73,6 +76,9 @@ __all__ = [
     "score_dataset",
     "CleanalytixConfig",
     "CleanalytixResult",
+    "ColumnRole",
+    "ConsistencyRule",
+    "TimelinessConfig",
     "DatasetProfile",
     "RelationshipProfile",
     "RecommendationItem",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+import warnings
 from collections import Counter
 from typing import Any, Optional, Sequence
 
@@ -66,23 +67,35 @@ def get_entropy(
                 return 0.0
 
             # Freedman-Diaconis rule
-            q75, q25 = np.percentile(clean_arr, [75, 25])
-            iqr = float(q75 - q25)
-            if iqr > 0:
-                bin_width = 2.0 * iqr / (n ** (1.0 / 3.0))
-            else:
-                # Scott's rule fallback
-                std = float(np.std(clean_arr, ddof=1)) if n > 1 else 0.0
-                if std > 0:
-                    bin_width = 3.49 * std / (n ** (1.0 / 3.0))
+            max_abs = float(np.max(np.abs(clean_arr)))
+            with np.errstate(over="ignore", invalid="ignore"):
+                q75, q25 = np.percentile(clean_arr, [75, 25])
+                iqr = float(q75 - q25)
+                if iqr > 0 and np.isfinite(iqr):
+                    bin_width = 2.0 * iqr / (n ** (1.0 / 3.0))
                 else:
-                    return 0.0
+                    # Scott's rule fallback
+                    if max_abs > 1e150:
+                        std = float(np.std(clean_arr / max_abs, ddof=1)) * max_abs if n > 1 else 0.0
+                    else:
+                        std = float(np.std(clean_arr, ddof=1)) if n > 1 else 0.0
+                    if std > 0 and np.isfinite(std):
+                        bin_width = 3.49 * std / (n ** (1.0 / 3.0))
+                    else:
+                        return 0.0
 
-            if bin_width <= 0:
+            if bin_width <= 0 or not np.isfinite(bin_width):
                 return 0.0
 
-            k = int(np.ceil((x_max - x_min) / bin_width))
-            k = max(5, min(k, 50))
+            try:
+                diff = x_max - x_min
+                if not np.isfinite(diff) or diff <= 0:
+                    k = 10
+                else:
+                    k = int(np.ceil(diff / bin_width))
+                    k = max(5, min(k, 50))
+            except Exception:
+                k = 10
             counts, _ = np.histogram(clean_arr, bins=k, range=(x_min, x_max))
             probs = counts / n
             probs = probs[probs > 0]
@@ -142,43 +155,42 @@ def get_type_error_count(df: pd.DataFrame, column: str) -> int:
             return True
         return False
 
-    numeric_conv = pd.to_numeric(col_non_null, errors="coerce")
-    datetime_conv = pd.to_datetime(col_non_null, errors="coerce", format="mixed")
-
-    numeric_ratio = float(numeric_conv.notna().mean()) if n_non_null else 0.0
-    datetime_ratio = float(datetime_conv.notna().mean()) if n_non_null else 0.0
-
-    if numeric_ratio >= 0.5 and numeric_ratio >= datetime_ratio:
+    if is_numeric_dtype(col_non_null) and not is_bool_dtype(col_non_null):
         expected = "numeric"
-    elif datetime_ratio >= 0.5 and datetime_ratio > numeric_ratio:
-        expected = "datetime"
     else:
-        expected = "categorical"
+        numeric_conv = pd.to_numeric(col_non_null, errors="coerce")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            datetime_conv = pd.to_datetime(col_non_null, errors="coerce", format="mixed")
+
+        numeric_ratio = float(numeric_conv.notna().mean()) if n_non_null else 0.0
+        datetime_ratio = float(datetime_conv.notna().mean()) if n_non_null else 0.0
+
+        if numeric_ratio >= 0.5 and numeric_ratio >= datetime_ratio:
+            expected = "numeric"
+        elif datetime_ratio >= 0.5 and datetime_ratio > numeric_ratio:
+            expected = "datetime"
+        else:
+            expected = "categorical"
 
     if expected == "numeric":
         converted = pd.to_numeric(col, errors="coerce")
-        return int(converted.isna().sum() - col.isna().sum())
+        return int(((converted.isna() & col.notna()) | np.isinf(converted)).sum())
 
     if expected == "datetime":
         converted = pd.to_datetime(col, errors="coerce", format="mixed")
         return int(converted.isna().sum() - col.isna().sum())
 
-    error_count = 0
-    for v in col:
-        if pd.isna(v):
-            continue
-        if is_numeric_value(v):
-            error_count += 1
-            continue
-        if is_date_like(v):
-            try:
-                parsed = pd.to_datetime(v, errors="raise", format="mixed")
-                if pd.notna(parsed):
-                    error_count += 1
-            except (ValueError, TypeError):
-                pass
+    # In a categorical/string column, legitimate category labels frequently include
+    # numeric codes ("404", "100"), date strings ("March 2024"), or range labels ("10-20").
+    # String values are valid categorical labels and must not be flagged as type errors.
+    # Only non-string objects (raw numeric or datetime types in a predominantly string column)
+    # represent type errors.
+    str_count = sum(1 for v in col_non_null if isinstance(v, str))
+    if str_count >= 0.5 * n_non_null:
+        return int(sum(1 for v in col_non_null if not isinstance(v, str)))
 
-    return error_count
+    return 0
 
 
 def rule_based_errors(
@@ -193,6 +205,8 @@ def rule_based_errors(
     rule_fn = rules[column]
     errors = 0
     for val in df[column]:
+        if pd.isna(val):
+            continue
         try:
             if not rule_fn(val):
                 errors += 1
@@ -415,7 +429,7 @@ def get_metrics(
                 vals = df[column].dropna().astype(str)
                 if not vals.empty:
                     freq = vals.value_counts(normalize=True) * 100.0
-                    rare = freq[freq <= 5.0]
+                    rare = freq[freq < 1.0]
                     rare_category_percent = float(rare.sum()) if not rare.empty else 0.0
                     whitespace_issues = int((vals.str.startswith(" ") | vals.str.endswith(" ")).sum())
                 else:
@@ -424,7 +438,10 @@ def get_metrics(
 
             # Datetime-like
             elif column_role == "datetime" or pd.api.types.is_datetime64_any_dtype(df[column]):
-                ser_dt = pd.to_datetime(df[column].astype(str), errors="coerce")
+                if pd.api.types.is_datetime64_any_dtype(df[column]):
+                    ser_dt = df[column]
+                else:
+                    ser_dt = pd.to_datetime(df[column], errors="coerce")
                 if ser_dt.notna().any():
                     min_date = ser_dt.min()
                     max_date = ser_dt.max()
@@ -437,7 +454,7 @@ def get_metrics(
                 vals = df[column].dropna().astype(str)
                 if not vals.empty:
                     freq = vals.value_counts(normalize=True) * 100.0
-                    rare = freq[freq <= 5.0]
+                    rare = freq[freq < 1.0]
                     rare_category_percent = float(rare.sum()) if not rare.empty else 0.0
                     whitespace_issues = int((vals.str.startswith(" ") | vals.str.endswith(" ")).sum())
                 else:

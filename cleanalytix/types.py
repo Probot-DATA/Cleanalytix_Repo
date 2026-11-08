@@ -388,8 +388,16 @@ class CleanalytixResult(dict):
         self["drift_summary"] = drift_summary or {}
         self["dataset_profile"] = dataset_profile if dataset_profile is not None else DatasetProfile()
         self["column_profile"] = column_profile if column_profile is not None else pd.DataFrame()
+        if self["column_profile"].empty and self["column_profile"].index.name is None:
+            self["column_profile"].index.name = "column_name"
+
         self["statistical_profile"] = statistical_profile if statistical_profile is not None else pd.DataFrame()
+        if self["statistical_profile"].empty and self["statistical_profile"].index.name is None:
+            self["statistical_profile"].index.name = "column_name"
+
         self["scoring_matrix"] = scoring_matrix if scoring_matrix is not None else pd.DataFrame()
+        if self["scoring_matrix"].empty and self["scoring_matrix"].index.name is None:
+            self["scoring_matrix"].index.name = "column_name"
         self["dimension_summary"] = dimension_summary if dimension_summary is not None else pd.DataFrame()
         self["metric_inventory"] = metric_inventory if metric_inventory is not None else pd.DataFrame()
         self["relationships"] = relationships if relationships is not None else RelationshipProfile()
@@ -400,8 +408,10 @@ class CleanalytixResult(dict):
         self["scoring_audit_trail"] = scoring_audit_trail or ""
         self["analysis_level"] = analysis_level
 
-        # Synthesize health_summary DataFrame
-        if not self["dataset_profile"].to_dataframe().empty:
+        # Synthesize health_summary DataFrame (or use passed health_summary if provided)
+        if "health_summary" in kwargs and kwargs["health_summary"] is not None:
+            self["health_summary"] = kwargs.pop("health_summary")
+        elif not self["dataset_profile"].to_dataframe().empty:
             dp = self["dataset_profile"]
             health_sum_df = pd.DataFrame([{
                 "dataset_name": "dataset",
@@ -410,9 +420,9 @@ class CleanalytixResult(dict):
                 "total_outliers": int(self["column_profile"]["outlier_count"].sum()) if not self["column_profile"].empty and "outlier_count" in self["column_profile"].columns else 0,
                 "total_whitespace_issues": int(self["column_profile"]["whitespace_count"].sum()) if not self["column_profile"].empty and "whitespace_count" in self["column_profile"].columns else 0,
             }])
+            self["health_summary"] = health_sum_df
         else:
-            health_sum_df = pd.DataFrame()
-        self["health_summary"] = health_sum_df
+            self["health_summary"] = pd.DataFrame()
 
         # Synthesize base_data if not provided
         if base_data is not None:

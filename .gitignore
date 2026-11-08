@@ -68,22 +68,11 @@ ehthumbs.db
 *.log
 logs/
 
-# Validation data and large generated datasets
-validation/datasets/**
-!validation/datasets/
-!validation/datasets/README.md
-!validation/datasets/adult/
-!validation/datasets/adult/.gitkeep
-!validation/datasets/customer_churn/
-!validation/datasets/customer_churn/.gitkeep
-!validation/datasets/UCI_credit_card/
-!validation/datasets/UCI_credit_card/.gitkeep
-!validation/datasets/yellow_trip_data/
-!validation/datasets/yellow_trip_data/.gitkeep
-!validation/datasets/CC_GENERAL/
-!validation/datasets/CC_GENERAL/.gitkeep
+# Legacy validation runs, notebooks, and datasets (v0.1.0)
+archive/
+validation/
 
-# Internal development notes, redundant audit reports, and scratch scripts
+# Scratch scripts and internal working drafts
 COMPREHENSIVE_ANALYTICAL_OUTPUTS_*.md
 DETAILED_OUTPUTS_FEASIBILITY_REPORT.md
 FINAL_ANALYTICAL_OUTPUTS_VERIFICATION.md
@@ -92,3 +81,4 @@ audit_reports/DETAILED_OUTPUTS_FEASIBILITY_REPORT.md
 audit_reports/FINAL_ANALYTICAL_OUTPUTS_VERIFICATION.md
 audit_reports/benchmark_empirical.py
 verify_clean_install.py
+cleanalytix/audit_reports/

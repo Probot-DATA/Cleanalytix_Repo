@@ -39,10 +39,23 @@ def compute_numeric_drift(
 
     Notes
     -----
-    When the baseline is constant (zero variance), continuous Jeffreys divergence
-    is formally undefined (infinite). Cleanalytix employs a discrete 3-bin surrogate
-    approximation (partitioning into intervals (-inf, c - delta), [c - delta, c + delta],
-    (c + delta, inf)) with Laplace smoothing to provide a smooth, continuous drift metric.
+    Cleanalytix computes discrete binned approximations of Population Stability
+    Index (PSI, discrete symmetric Jeffreys divergence), Kullback-Leibler (KL)
+    divergence, and Jensen-Shannon Divergence (JSD) rather than exact continuous
+    divergences:
+    1. Continuous baselines: empirical quantile binning partitions the baseline
+       into up to 10 discrete intervals with exterior boundaries extended to
+       (-inf, q1) and [q9, inf).
+    2. Constant baseline (zero variance): discrete 3-bin surrogate approximation
+       partitioning the real line into (-inf, c - delta), [c - delta, c + delta],
+       and (c + delta, inf).
+    3. Two-edge / collapsed quantile baseline (e0 < e1): discrete 5-bin surrogate
+       partitioning into (-inf, e0 - delta0), [e0 - delta0, e0 + delta0),
+       [e0 + delta0, e1 - delta1), [e1 - delta1, e1 + delta1), and [e1 + delta1, inf)
+       so that interior boundaries and outer distribution shifts are preserved
+       without histogram collapse.
+    Laplace smoothing with parameter epsilon ensures strictly positive bin probabilities
+    and guarantees finite, well-behaved divergence values.
     """
     b_clean = pd.to_numeric(base_series, errors="coerce").dropna()
     p_clean = pd.to_numeric(prod_series, errors="coerce").dropna()
@@ -87,17 +100,33 @@ def compute_numeric_drift(
 
     # 2. Wasserstein distance
     w_dist = float(stats.wasserstein_distance(b_arr, p_arr))
-    # Normalized Wasserstein by pooled standard deviation
-    b_std = float(np.std(b_arr, ddof=1)) if n_b > 1 else 0.0
-    p_std = float(np.std(p_arr, ddof=1)) if n_p > 1 else 0.0
-    pooled_std = math.sqrt(0.5 * (b_std**2 + p_std**2)) if (b_std + p_std) > 0 else 1.0
-    norm_w = float(w_dist / pooled_std) if pooled_std > 1e-12 else 0.0
+    # Normalized Wasserstein by pooled standard deviation (scale-guarded against float64 overflow)
+    max_scale = max(float(np.max(np.abs(b_arr))), float(np.max(np.abs(p_arr))))
+    if max_scale > 1e150:
+        scaled_b = b_arr / max_scale
+        scaled_p = p_arr / max_scale
+        with np.errstate(over="ignore", invalid="ignore"):
+            sb_std = float(np.std(scaled_b, ddof=1)) if n_b > 1 else 0.0
+            sp_std = float(np.std(scaled_p, ddof=1)) if n_p > 1 else 0.0
+            scaled_pooled = math.sqrt(0.5 * (sb_std**2 + sp_std**2)) if (sb_std + sp_std) > 0 else 1.0
+            norm_w = float((w_dist / max_scale) / scaled_pooled) if scaled_pooled > 1e-12 else 0.0
+    else:
+        with np.errstate(over="ignore", invalid="ignore"):
+            b_std = float(np.std(b_arr, ddof=1)) if n_b > 1 else 0.0
+            p_std = float(np.std(p_arr, ddof=1)) if n_p > 1 else 0.0
+            try:
+                pooled_std = math.sqrt(0.5 * (b_std**2 + p_std**2)) if (b_std + p_std) > 0 else 1.0
+                norm_w = float(w_dist / pooled_std) if pooled_std > 1e-12 else 0.0
+            except OverflowError:
+                norm_w = 0.0
 
     # 3. Discretization for Binned PSI, KL, and JS Divergence
     if b_min == b_max:
         # Constant baseline: discrete 3-bin surrogate approximation (partitioning into before, at, and after constant value)
         delta = 1e-7 * (abs(b_min) + 1.0)
-        bin_edges = np.array([-np.inf, b_min - delta, b_min + delta, np.inf])
+        b_low = min(b_min - delta, float(np.nextafter(b_min, -np.inf)))
+        b_high = max(b_min + delta, float(np.nextafter(b_min, np.inf)))
+        bin_edges = np.array([-np.inf, b_low, b_high, np.inf], dtype=float)
     else:
         # 10-quantile binning over baseline distribution
         quantiles = np.linspace(0, 100, num_bins + 1)
@@ -105,7 +134,50 @@ def compute_numeric_drift(
         bin_edges = np.unique(bin_edges)
         if len(bin_edges) <= 1:
             delta = 1e-7 * (abs(b_min) + 1.0)
-            bin_edges = np.array([-np.inf, b_min - delta, b_min + delta, np.inf])
+            b_low = min(b_min - delta, float(np.nextafter(b_min, -np.inf)))
+            b_high = max(b_min + delta, float(np.nextafter(b_min, np.inf)))
+            bin_edges = np.array([-np.inf, b_low, b_high, np.inf], dtype=float)
+        elif len(bin_edges) == 2:
+            # Two-edge / collapsed quantile case: discrete 5-bin surrogate approximation
+            # Partitions into: (-inf, b1), [b1, b2), [b2, b3), [b3, b4), [b4, inf)
+            # strictly satisfying -inf < b1 < e0 < b2 < b3 < e1 < b4 < inf across all float scales.
+            e0, e1 = float(bin_edges[0]), float(bin_edges[1])
+            g = e1 - e0
+            eps0 = float(np.spacing(e0))
+            eps1 = float(np.spacing(e1))
+
+            target_d0 = min(0.25 * g, max(1e-4 * g, 1e-7 * (abs(e0) + 1.0)))
+            target_d1 = min(0.25 * g, max(1e-4 * g, 1e-7 * (abs(e1) + 1.0)))
+
+            d0 = max(target_d0, eps0)
+            d1 = max(target_d1, eps1)
+
+            if d0 + d1 >= 0.8 * g:
+                d0 = 0.25 * g
+                d1 = 0.25 * g
+
+            b1 = e0 - d0
+            b2 = e0 + d0
+            b3 = e1 - d1
+            b4 = e1 + d1
+
+            # Precision guards to strictly ensure -inf < b1 < e0 < b2 < b3 < e1 < b4 < inf
+            if not (b1 < e0):
+                b1 = float(np.nextafter(e0, -np.inf))
+            if not (e0 < b2):
+                b2 = float(np.nextafter(e0, np.inf))
+            if not (b2 < b3):
+                b2 = float(e0 + g / 3.0)
+                b3 = float(e0 + 2.0 * g / 3.0)
+                if not (e0 < b2 < b3 < e1):
+                    b2 = float(np.nextafter(e0, np.inf))
+                    b3 = float(np.nextafter(e1, -np.inf))
+            if not (b3 < e1):
+                b3 = float(np.nextafter(e1, -np.inf))
+            if not (e1 < b4):
+                b4 = float(np.nextafter(e1, np.inf))
+
+            bin_edges = np.array([-np.inf, b1, b2, b3, b4, np.inf], dtype=float)
         else:
             bin_edges[0] = -np.inf
             bin_edges[-1] = np.inf

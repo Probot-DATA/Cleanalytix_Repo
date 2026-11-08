@@ -213,6 +213,15 @@ def cleaning_recommendations(meta_data_combined: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(recs)
 
 
+def normalize_severity(severity: Any) -> str:
+    """Normalize severity to uppercase standard string (CRITICAL, WARNING, INFO, OPTIMIZATION)."""
+    if isinstance(severity, InsightSeverity):
+        return severity.name
+    if hasattr(severity, "value"):
+        return str(severity.value).strip().upper()
+    return str(severity).strip().upper()
+
+
 def generate_recommendations(
     meta_df: pd.DataFrame,
     insights: Optional[List[InsightItem]] = None,
@@ -236,11 +245,16 @@ def generate_recommendations(
     # 1. Dataset-level and multidimensional items from insights
     if insights:
         for ins in insights:
-            sev_str = ins.severity.value if isinstance(ins.severity, InsightSeverity) else str(ins.severity)
+            sev_str = normalize_severity(ins.severity)
             if sev_str in {"CRITICAL", "WARNING"}:
+                # Avoid duplicating column-level completeness/validity recommendations already generated from meta_df
+                if meta_df is not None and not meta_df.empty:
+                    if ins.dimension in {QualityDimension.COMPLETENESS, QualityDimension.VALIDITY} and ins.column is not None:
+                        continue
+
                 # Map insight metric to rule_id if applicable
                 r_id = 8 if "rule" in ins.metric_name or "consistency" in ins.metric_name else (
-                    1 if "duplicate" in ins.metric_name else (
+                    11 if "duplicate" in ins.metric_name else (
                         6 if "date" in ins.metric_name or "freshness" in ins.metric_name else (
                             12 if "psi" in ins.metric_name or "drift" in ins.metric_name else 0
                         )
@@ -272,7 +286,7 @@ def generate_recommendations(
             type_err = row.get("type_errors", 0)
             if pd.notna(type_err) and int(type_err) > 0:
                 t_cnt = int(type_err)
-                t_pct = (t_cnt / n_total) * 100.0
+                t_pct = (t_cnt / max(1, n_non_null)) * 100.0 if n_non_null > 0 else 0.0
                 raw_items.append({
                     "rule_id": 7,
                     "dimension": QualityDimension.VALIDITY,
@@ -289,7 +303,7 @@ def generate_recommendations(
             ws_err = row.get("whitespace_issues", 0)
             if pd.notna(ws_err) and int(ws_err) > 0:
                 w_cnt = int(ws_err)
-                w_pct = (w_cnt / n_total) * 100.0
+                w_pct = (w_cnt / max(1, n_non_null)) * 100.0 if n_non_null > 0 else 0.0
                 raw_items.append({
                     "rule_id": 4,
                     "dimension": QualityDimension.VALIDITY,
@@ -447,6 +461,7 @@ def generate_recommendations(
             "dimension": it["dimension"].value if hasattr(it["dimension"], "value") else str(it["dimension"]),
             "severity": it["severity"],
             "affected_column": it["affected_column"],
+            "column_name": it["affected_column"],
             "issue_name": it["issue_name"],
             "evidence": it["evidence"],
             "rationale": it["rationale"],
@@ -456,7 +471,7 @@ def generate_recommendations(
     if not table_rows:
         table_df = pd.DataFrame(columns=[
             "priority_rank", "rule_id", "dimension", "severity", "affected_column",
-            "issue_name", "evidence", "rationale", "suggested_action"
+            "column_name", "issue_name", "evidence", "rationale", "suggested_action"
         ])
     else:
         table_df = pd.DataFrame(table_rows)

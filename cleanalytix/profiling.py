@@ -288,6 +288,8 @@ def build_column_profile(
     col_df = pd.DataFrame(rows)
     if not col_df.empty:
         col_df.set_index("column_name", inplace=True)
+    else:
+        col_df.index.name = "column_name"
     return col_df
 
 
@@ -458,6 +460,8 @@ def build_statistical_profile(
     stat_df = pd.DataFrame(rows)
     if not stat_df.empty:
         stat_df.set_index("column_name", inplace=True)
+    else:
+        stat_df.index.name = "column_name"
     return stat_df
 
 
@@ -606,7 +610,16 @@ def build_temporal_profile(
     """
     cfg = config or CleanalytixConfig()
     time_cfg = cfg.timeliness_config
-    ref_time = getattr(time_cfg, "reference_time", None) if time_cfg else None
+    if time_cfg:
+        if isinstance(time_cfg, dict):
+            ref_time = time_cfg.get("reference_time")
+            fresh_thresh = float(time_cfg.get("freshness_days", 30.0))
+        else:
+            ref_time = getattr(time_cfg, "reference_time", None)
+            fresh_thresh = float(getattr(time_cfg, "freshness_days", 30.0))
+    else:
+        ref_time = None
+        fresh_thresh = 30.0
 
     # Detect datetime columns
     dt_cols = []
@@ -618,7 +631,9 @@ def build_temporal_profile(
             dt_cols.append(col)
 
     if not dt_cols:
-        return pd.DataFrame()
+        empty_temp_df = pd.DataFrame()
+        empty_temp_df.index.name = "column_name"
+        return empty_temp_df
 
     rows = []
     for col in dt_cols:
@@ -648,7 +663,7 @@ def build_temporal_profile(
         if fresh_days is not None:
             if fresh_days <= 7.0:
                 fresh_status = "FRESH"
-            elif fresh_days <= 30.0:
+            elif fresh_days <= fresh_thresh:
                 fresh_status = "ACCEPTABLE"
             else:
                 fresh_status = "STALE"
@@ -677,6 +692,8 @@ def build_temporal_profile(
     temp_df = pd.DataFrame(rows)
     if not temp_df.empty:
         temp_df.set_index("column_name", inplace=True)
+    else:
+        temp_df.index.name = "column_name"
     return temp_df
 
 

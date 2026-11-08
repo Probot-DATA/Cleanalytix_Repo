@@ -227,11 +227,10 @@ def compute_identifier_uniqueness(
 
     cols = identifier_columns
     if cols is None:
-        # Detect candidates heuristically
-        cols = [
-            c for c in df.columns
-            if any(k in str(c).lower() for k in ["_id", "id", "uuid", "guid", "pk", "key", "code"])
-        ]
+        # Detect candidates heuristically using semantic column role heuristics
+        from ..column_role import is_identifier_column
+
+        cols = [c for c in df.columns if is_identifier_column(df[c], str(c), n_rows=total_rows)]
 
     cols = [c for c in cols if c in df.columns]
     if not cols:

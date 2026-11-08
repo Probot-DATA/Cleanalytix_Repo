@@ -61,6 +61,21 @@ def is_binary_flag(series: pd.Series) -> bool:
     return len(unique) <= 2 and unique.issubset({"0", "1", "true", "false", "yes", "no", "y", "n", "t", "f"})
 
 
+def is_free_text_column(series: pd.Series) -> bool:
+    """Return whether a non-numeric Series behaves like unstructured free text."""
+    values = series.dropna().astype(str)
+    if values.empty:
+        return False
+
+    # Check average character length and word count
+    sample = values.head(200)
+    word_counts = sample.str.split().str.len()
+    avg_words = float(word_counts.mean()) if not word_counts.empty else 0.0
+    avg_length = float(sample.str.len().mean()) if not sample.empty else 0.0
+
+    return avg_words >= 3.5 or avg_length > 40
+
+
 def is_identifier_column(
     series: pd.Series,
     column_name: object = None,
@@ -88,25 +103,14 @@ def is_identifier_column(
     # 2. Perfect 100% uniqueness for non-empty string/numeric columns of sufficient size
     if unique_ratio == 1.0 and n_rows >= 10 and not is_bool_dtype(series):
         # Distinguish from continuous floats (which might happen to be unique)
-        if not (is_numeric_dtype(series) and not is_bool_dtype(series) and not name_hint):
-            return True
+        if is_numeric_dtype(series) and not is_bool_dtype(series) and not name_hint:
+            return False
+        # String/object columns without name hint must not be unstructured free text
+        if not name_hint and is_free_text_column(series):
+            return False
+        return True
 
     return False
-
-
-def is_free_text_column(series: pd.Series) -> bool:
-    """Return whether a non-numeric Series behaves like unstructured free text."""
-    values = series.dropna().astype(str)
-    if values.empty:
-        return False
-
-    # Check average character length and word count
-    sample = values.head(200)
-    word_counts = sample.str.split().str.len()
-    avg_words = float(word_counts.mean()) if not word_counts.empty else 0.0
-    avg_length = float(sample.str.len().mean()) if not sample.empty else 0.0
-
-    return avg_words >= 3.5 or avg_length > 40
 
 
 def infer_column_role(

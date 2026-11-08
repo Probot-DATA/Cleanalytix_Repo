@@ -214,8 +214,8 @@ def generate_dataset_insights(
         # Validity: Type errors
         type_err = row.get("type_errors", 0)
         if pd.notna(type_err) and int(type_err) > 0:
-            n_total = int(row.get("non_null_count", 0)) + int(row.get("missing_count", 0))
-            err_pct = (int(type_err) / max(1, n_total)) * 100.0
+            n_non_null = int(row.get("non_null_count", 0))
+            err_pct = (int(type_err) / max(1, n_non_null)) * 100.0 if n_non_null > 0 else 0.0
             type_thresh = thresholds.get("type_errors_percent", 2.0)
             if err_pct > type_thresh:
                 insights.append(
@@ -237,8 +237,8 @@ def generate_dataset_insights(
         # Validity: Whitespace issues (strings/categorical)
         ws_err = row.get("whitespace_issues", 0)
         if pd.notna(ws_err) and int(ws_err) > 0:
-            n_total = int(row.get("non_null_count", 0)) + int(row.get("missing_count", 0))
-            ws_pct = (int(ws_err) / max(1, n_total)) * 100.0
+            n_non_null = int(row.get("non_null_count", 0))
+            ws_pct = (int(ws_err) / max(1, n_non_null)) * 100.0 if n_non_null > 0 else 0.0
             ws_thresh = thresholds.get("whitespace_percent", 5.0)
             if ws_pct > ws_thresh:
                 insights.append(
@@ -259,8 +259,8 @@ def generate_dataset_insights(
         # Validity: Rule errors
         rule_err = row.get("rule_errors", 0)
         if pd.notna(rule_err) and int(rule_err) > 0:
-            n_total = int(row.get("non_null_count", 0)) + int(row.get("missing_count", 0))
-            rule_pct = (int(rule_err) / max(1, n_total)) * 100.0
+            n_non_null = int(row.get("non_null_count", 0))
+            rule_pct = (int(rule_err) / max(1, n_non_null)) * 100.0 if n_non_null > 0 else 0.0
             rule_thresh = thresholds.get("rule_errors_percent", 2.0)
             if rule_pct > rule_thresh:
                 insights.append(
@@ -358,6 +358,7 @@ def build_anomalies_dataframe(insights: List[InsightItem]) -> pd.DataFrame:
             "severity": sev_str,
             "dimension": dim_str,
             "column": item.column,
+            "column_name": item.column,
             "metric_name": item.metric_name,
             "metric_value": item.metric_value,
             "threshold": item.threshold,
@@ -366,7 +367,7 @@ def build_anomalies_dataframe(insights: List[InsightItem]) -> pd.DataFrame:
         })
     if not rows:
         return pd.DataFrame(columns=[
-            "severity", "dimension", "column", "metric_name", "metric_value",
+            "severity", "dimension", "column", "column_name", "metric_name", "metric_value",
             "threshold", "message", "recommendation"
         ])
     return pd.DataFrame(rows)

@@ -19,7 +19,7 @@ EPS = 1e-9
 def learn_reference_profile(
     dataset_names: Sequence[str],
     dataset_list: Sequence[pd.DataFrame],
-    rare_pct_threshold: float = 5.0,
+    rare_pct_threshold: float = 1.0,
 ) -> ReferenceProfile:
     """Learn baseline column statistics for production metadata adjustment.
 
@@ -29,7 +29,7 @@ def learn_reference_profile(
         Names aligned with ``dataset_list``.
     dataset_list : sequence of pandas.DataFrame
         Baseline/reference datasets.
-    rare_pct_threshold : float, default=5.0
+    rare_pct_threshold : float, default=1.0
         Threshold for categoricals.
 
     Returns
