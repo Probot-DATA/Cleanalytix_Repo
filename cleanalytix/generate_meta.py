@@ -1,14 +1,13 @@
 """Comprehensive metadata profiling and dataset characterization module for Cleanalytix.
 
-Computes column-level profiling metrics, statistical distributions, cardinality,
-type conformance, whitespace issues, custom rule errors, and distribution drift.
+In Cleanalytix v2.0 (Phase 3), ``generate_meta()`` serves as a non-recursive
+backward-compatibility facade that delegates profiling directly to
+``build_profile_context()`` and projects the resulting ``ProfileContext`` into
+the legacy 32-column ``meta_df`` schema via ``LegacyMetaAdapter.context_to_meta_df()``.
 """
 
 from __future__ import annotations
 
-import math
-import re
-import warnings
 from collections import Counter
 from typing import Any, Optional, Sequence
 
@@ -20,18 +19,25 @@ from cleanalytix.column_role import (
     harmonize_series_for_drift,
     infer_column_role,
 )
-from cleanalytix.types import ColumnRole, Rules
-from cleanalytix.metrics.drift import (
-    compute_numeric_drift,
-    compute_categorical_drift,
-)
-from cleanalytix.metrics.statistical import (
-    compute_numeric_statistics,
-    detect_outliers,
-)
+from cleanalytix.legacy.adapter import LegacyMetaAdapter
 from cleanalytix.metrics.distribution import (
     compute_categorical_distribution,
 )
+from cleanalytix.metrics.drift import (
+    compute_categorical_drift,
+    compute_numeric_drift,
+)
+from cleanalytix.metrics.statistical import (
+    compute_continuous_entropy,
+    compute_numeric_statistics,
+    detect_outliers,
+)
+from cleanalytix.metrics.validity import (
+    compute_rule_validity_metrics,
+    compute_type_validity_metrics,
+)
+from cleanalytix.profiling import build_profile_context
+from cleanalytix.types import ColumnRole, ProfileContext, Rules
 
 EPS = 1e-9
 
@@ -43,154 +49,36 @@ def get_entropy(
 ) -> float:
     """Compute normalized Shannon entropy in [0.0, 1.0] for one column.
 
-    For continuous/discrete numeric columns, uses equal-width histogram binning
-    with the Freedman-Diaconis rule (or Scott's rule fallback) over [min, max].
-    This provides normalized discrete entropy H / ln(K) in [0, 1], properly
-    distinguishing uniform, peaked, skewed, and constant distributions.
-    For categorical columns, uses the normalized discrete Shannon entropy over
-    observed category frequencies.
+    Delegates continuous/discrete numeric entropy to
+    ``cleanalytix.metrics.statistical.compute_continuous_entropy`` and
+    categorical/discrete-symbol entropy to
+    ``cleanalytix.metrics.distribution.compute_categorical_distribution``.
     """
     try:
         col_ser = df_base[column]
         if column_role is None:
             column_role = infer_column_role(col_ser, column, len(df_base))
 
-        if column_role in {"continuous", "discrete"} and is_numeric_dtype(col_ser) and not is_bool_dtype(col_ser):
-            clean = pd.to_numeric(col_ser, errors="coerce").dropna()
-            clean_arr = clean[~np.isinf(clean)].to_numpy(dtype=float)
-            n = len(clean_arr)
-            if n < 2:
-                return 0.0
+        if (
+            column_role in {"continuous", "discrete"}
+            and is_numeric_dtype(col_ser)
+            and not is_bool_dtype(col_ser)
+        ):
+            return float(compute_continuous_entropy(col_ser))
 
-            x_min, x_max = float(np.min(clean_arr)), float(np.max(clean_arr))
-            if x_min == x_max:
-                return 0.0
-
-            # Freedman-Diaconis rule
-            max_abs = float(np.max(np.abs(clean_arr)))
-            with np.errstate(over="ignore", invalid="ignore"):
-                q75, q25 = np.percentile(clean_arr, [75, 25])
-                iqr = float(q75 - q25)
-                if iqr > 0 and np.isfinite(iqr):
-                    bin_width = 2.0 * iqr / (n ** (1.0 / 3.0))
-                else:
-                    # Scott's rule fallback
-                    if max_abs > 1e150:
-                        std = float(np.std(clean_arr / max_abs, ddof=1)) * max_abs if n > 1 else 0.0
-                    else:
-                        std = float(np.std(clean_arr, ddof=1)) if n > 1 else 0.0
-                    if std > 0 and np.isfinite(std):
-                        bin_width = 3.49 * std / (n ** (1.0 / 3.0))
-                    else:
-                        return 0.0
-
-            if bin_width <= 0 or not np.isfinite(bin_width):
-                return 0.0
-
-            try:
-                diff = x_max - x_min
-                if not np.isfinite(diff) or diff <= 0:
-                    k = 10
-                else:
-                    k = int(np.ceil(diff / bin_width))
-                    k = max(5, min(k, 50))
-            except Exception:
-                k = 10
-            counts, _ = np.histogram(clean_arr, bins=k, range=(x_min, x_max))
-            probs = counts / n
-            probs = probs[probs > 0]
-            if len(probs) <= 1:
-                return 0.0
-            h = -float(np.sum(probs * np.log(probs)))
-            norm_ent = float(h / math.log(k))
-            return min(1.0, max(0.0, norm_ent))
-
-        else:
-            clean = col_ser.dropna()
-            n = len(clean)
-            if n < 2:
-                return 0.0
-            try:
-                val_counts = clean.value_counts()
-            except TypeError:
-                val_counts = clean.astype(str).value_counts()
-
-            k = len(val_counts)
-            if k <= 1:
-                return 0.0
-            probs = val_counts.to_numpy(dtype=float) / n
-            h = -float(np.sum(probs * np.log(probs + 1e-15)))
-            norm_ent = float(h / math.log(k))
-            return min(1.0, max(0.0, norm_ent))
-
+        dist = compute_categorical_distribution(col_ser)
+        return float(dist.get("normalized_entropy", 0.0))
     except Exception:
         return 0.0
 
 
 def get_type_error_count(df: pd.DataFrame, column: str) -> int:
-    """Count values that conflict with the column's inferred semantic type."""
-    col = df[column]
-    col_non_null = col.dropna()
-    n_non_null = len(col_non_null)
+    """Count values that conflict with the column's inferred semantic type.
 
-    if n_non_null == 0:
-        return 0
-
-    def is_numeric_value(v):
-        if isinstance(v, bool):
-            return False
-        try:
-            pd.to_numeric([v], errors="raise")
-            return True
-        except (ValueError, TypeError):
-            return False
-
-    def is_date_like(v):
-        if not isinstance(v, str):
-            return False
-        s = v.strip()
-        if re.search(r"[-/:\sT]", s):
-            return True
-        if s.isdigit() and len(s) == 8:
-            return True
-        return False
-
-    if is_numeric_dtype(col_non_null) and not is_bool_dtype(col_non_null):
-        expected = "numeric"
-    else:
-        numeric_conv = pd.to_numeric(col_non_null, errors="coerce")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            datetime_conv = pd.to_datetime(col_non_null, errors="coerce", format="mixed")
-
-        numeric_ratio = float(numeric_conv.notna().mean()) if n_non_null else 0.0
-        datetime_ratio = float(datetime_conv.notna().mean()) if n_non_null else 0.0
-
-        if numeric_ratio >= 0.5 and numeric_ratio >= datetime_ratio:
-            expected = "numeric"
-        elif datetime_ratio >= 0.5 and datetime_ratio > numeric_ratio:
-            expected = "datetime"
-        else:
-            expected = "categorical"
-
-    if expected == "numeric":
-        converted = pd.to_numeric(col, errors="coerce")
-        return int(((converted.isna() & col.notna()) | np.isinf(converted)).sum())
-
-    if expected == "datetime":
-        converted = pd.to_datetime(col, errors="coerce", format="mixed")
-        return int(converted.isna().sum() - col.isna().sum())
-
-    # In a categorical/string column, legitimate category labels frequently include
-    # numeric codes ("404", "100"), date strings ("March 2024"), or range labels ("10-20").
-    # String values are valid categorical labels and must not be flagged as type errors.
-    # Only non-string objects (raw numeric or datetime types in a predominantly string column)
-    # represent type errors.
-    str_count = sum(1 for v in col_non_null if isinstance(v, str))
-    if str_count >= 0.5 * n_non_null:
-        return int(sum(1 for v in col_non_null if not isinstance(v, str)))
-
-    return 0
+    Delegates to ``cleanalytix.metrics.validity.compute_type_validity_metrics``.
+    """
+    res = compute_type_validity_metrics(df[column])
+    return int(res["type_error_count"])
 
 
 def rule_based_errors(
@@ -198,21 +86,15 @@ def rule_based_errors(
     column: str,
     rules: Optional[Rules] = None,
 ) -> int:
-    """Count values that fail a user-defined business rule."""
+    """Count values that fail a user-defined business rule.
+
+    Delegates to ``cleanalytix.metrics.validity.compute_rule_validity_metrics``.
+    """
     if not rules or column not in rules:
         return 0
 
-    rule_fn = rules[column]
-    errors = 0
-    for val in df[column]:
-        if pd.isna(val):
-            continue
-        try:
-            if not rule_fn(val):
-                errors += 1
-        except Exception:
-            errors += 1
-    return errors
+    res = compute_rule_validity_metrics(df[column], rules[column])
+    return int(res["rule_error_count"])
 
 
 def get_probs(
@@ -266,7 +148,9 @@ def KL_PSI_and_JS(
     """Compute drift divergences (KL, PSI, JS) for one baseline/production column pair."""
     try:
         column_role = infer_column_role(df_base[column], column, len(df_base))
-        base_series, new_series = harmonize_series_for_drift(df_base[column], df_new[column])
+        base_series, new_series = harmonize_series_for_drift(
+            df_base[column].dropna(), df_new[column].dropna()
+        )
 
         # Use specialized drift module for numeric continuous
         if column_role in {"continuous", "discrete"} and is_numeric_dtype(base_series) and not is_bool_dtype(base_series):
@@ -282,7 +166,7 @@ def KL_PSI_and_JS(
         if len(base_clean) == 0 or len(new_clean) == 0:
             return 0.0, 0.0, 0.0
 
-        cat_drift = compute_categorical_drift(base_series, new_series)
+        cat_drift = compute_categorical_drift(base_clean, new_clean)
         kl_val = cat_drift.get("kl_divergence", 0.0)
         psi_val = cat_drift["psi"]
         js_val = cat_drift["js_divergence"]
@@ -502,7 +386,11 @@ def generate_meta(
     new_dataset_list: Optional[Sequence[pd.DataFrame]] = None,
     rules: Optional[Rules] = None,
 ) -> pd.DataFrame:
-    """Generate the full Cleanalytix metadata table.
+    """Generate the full 32-column Cleanalytix legacy metadata table.
+
+    Non-recursive facade that constructs ``ProfileContext`` instances via
+    ``build_profile_context()`` and projects them into the legacy 32-column
+    ``meta_df`` schema via ``LegacyMetaAdapter.context_to_meta_df()``.
 
     Fixed and validated:
     - BUG-03: Baseline-only profiling does NOT self-split or penalize dataset against itself.
@@ -532,64 +420,6 @@ def generate_meta(
                     f"Columns must be strictly unique for data quality analysis."
                 )
 
-    profile_list = new_dataset_list if new_dataset_list is not None else dataset_list
-    data = get_metrics(profile_list, dataset_name_list, rules)
-
-    meta_data = pd.DataFrame(
-        data=data,
-        columns=[
-            "dataset_name",
-            "column_name",
-            "column_role",
-            "dtype",
-            "non_null_count",
-            "missing_count",
-            "missing_percent",
-            "unique_count",
-            "unique_percent",
-            "mode",
-            "mode_percent",
-            "mean",
-            "std",
-            "skewness",
-            "skewness_level",
-            "min",
-            "max",
-            "median",
-            "outlier_count",
-            "num_categories",
-            "rare_category_percent",
-            "whitespace_issues",
-            "min_date",
-            "max_date",
-            "date_range_days",
-            "Entropy",
-            "type_errors",
-            "rule_errors",
-            "duplicate_rows_percent",
-        ],
-    )
-    meta_data.replace({pd.NaT: np.nan}, inplace=True)
-
-    # Compute drift metrics
-    if new_dataset_list is None:
-        # BUG-03 FIX: Single dataset baseline mode does NOT split against itself.
-        # Divergence of dataset against itself is 0.0.
-        drift_rows = []
-        for df, ds_name in zip(dataset_list, dataset_name_list):
-            for col in df.columns:
-                drift_rows.append([ds_name, col, 0.0, 0.0, 0.0])
-        meta_table_adv = pd.DataFrame(
-            data=drift_rows,
-            columns=[
-                "dataset_name",
-                "column_name",
-                "kl_divergence",
-                "psi_divergence",
-                "js_divergence",
-            ],
-        )
-    else:
         if len(new_dataset_list) != len(dataset_list):
             raise ValueError("new_dataset_list must match dataset_list length")
 
@@ -603,22 +433,29 @@ def generate_meta(
                     f"Extra in new: {extra_in_new}."
                 )
 
-        metrics = drift_metrics(dataset_name_list, dataset_list, new_dataset_list)
-        meta_table_adv = pd.DataFrame(
-            data=metrics,
-            columns=[
-                "dataset_name",
-                "column_name",
-                "kl_divergence",
-                "psi_divergence",
-                "js_divergence",
-            ],
-        )
+    contexts: list[ProfileContext] = []
+    if new_dataset_list is None:
+        for df, ds_name in zip(dataset_list, dataset_name_list):
+            target_df = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+            ctx = build_profile_context(
+                target_df,
+                baseline_df=None,
+                rules=rules,
+                dataset_name=str(ds_name),
+                include_relationships=False,
+            )
+            contexts.append(ctx)
+    else:
+        for ref_df, new_df, ds_name in zip(dataset_list, new_dataset_list, dataset_name_list):
+            base_df = ref_df if isinstance(ref_df, pd.DataFrame) else pd.DataFrame(ref_df)
+            target_df = new_df if isinstance(new_df, pd.DataFrame) else pd.DataFrame(new_df)
+            ctx = build_profile_context(
+                target_df,
+                baseline_df=base_df,
+                rules=rules,
+                dataset_name=str(ds_name),
+                include_relationships=False,
+            )
+            contexts.append(ctx)
 
-    meta_table_combined = pd.merge(
-        meta_data,
-        meta_table_adv,
-        on=["dataset_name", "column_name"],
-        how="inner",
-    )
-    return meta_table_combined
+    return LegacyMetaAdapter.context_to_meta_df(contexts)

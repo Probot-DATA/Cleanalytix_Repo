@@ -25,6 +25,7 @@ from cleanalytix.insights import generate_dataset_insights, build_anomalies_data
 from cleanalytix.metrics.uniqueness import detect_candidate_keys, compute_duplicate_row_metrics
 from cleanalytix.metrics.relationships import compute_numeric_correlations
 from cleanalytix.profiling import (
+    build_profile_context,
     build_dataset_profile,
     build_column_profile,
     build_statistical_profile,
@@ -36,6 +37,7 @@ from cleanalytix.types import (
     DQPipelineResult,
     MetricWeights,
     PipelineBlock,
+    _LazyPipelineBlock,
     Rules,
     ScoreMode,
     Thresholds,
@@ -113,54 +115,56 @@ def analyze(
     dataset_name = "dataset"
     has_baseline = baseline_df is not None
 
-    # Step 1: Generate metadata profiling & reference adjustments
-    if has_baseline:
+    # Step 1: Build unified ProfileContext (Phase 4 pipeline inversion — no generate_meta)
+    if has_baseline and baseline_df is not None:
         # 1a. Profile baseline independently
-        base_meta = generate_meta(
-            [dataset_name],
-            [baseline_df],
+        base_context = build_profile_context(
+            baseline_df,
+            config=config,
             rules=config.rules,
+            dataset_name=dataset_name,
         )
         base_score, _, _, _, _, _, _ = score_dataset(
             baseline_df,
-            base_meta,
+            base_context,
             config=config,
             has_baseline=False,
             return_details=True,
         )
-        base_health = summarize_dataset_health(base_meta)
-        base_metrics = get_table_for_DQ_computation(base_meta, [baseline_df], [dataset_name])
-        base_recs = cleaning_recommendations(base_meta)
+        base_health = summarize_dataset_health(base_context)
+        base_metrics = get_table_for_DQ_computation(base_context)
+        base_recs = cleaning_recommendations(base_context)
 
-        base_data = _empty_base_block()
-        base_data.update({
+        base_block_init = _empty_base_block()
+        base_block_init.pop("meta_before_cleaning", None)
+        base_block_init.update({
             "dirty_scores": pd.DataFrame([{"Dataset_name": dataset_name, "DQ_Score": base_score}]),
-            "meta_before_cleaning": base_meta,
             "recommendations": base_recs,
             "summarized_before": base_health,
             "main_metrics_before": base_metrics,
         })
+        base_data: Optional[Any] = _LazyPipelineBlock(
+            base_block_init,
+            _meta_context=base_context,
+        )
 
         # 1b. Learn reference profile from baseline and profile production with drift
         ref_profile = learn_reference_profile([dataset_name], [baseline_df])
-        prod_meta_raw = generate_meta(
-            [dataset_name],
-            [baseline_df],
-            new_dataset_list=[df],
+        context = build_profile_context(
+            df,
+            baseline_df=baseline_df,
+            config=config,
             rules=config.rules,
-        )
-        meta_df = adjust_prod_meta_with_reference(
-            ref_profile,
-            base_meta,
-            prod_meta_raw,
-            [dataset_name],
-            [df],
+            dataset_name=dataset_name,
+            reference_profile=ref_profile,
         )
     else:
-        meta_df = generate_meta(
-            [dataset_name],
-            [df],
+        base_context = None
+        context = build_profile_context(
+            df,
+            config=config,
             rules=config.rules,
+            dataset_name=dataset_name,
         )
         base_data = None
 
@@ -174,18 +178,18 @@ def analyze(
         metric_inventory_df,
         scoring_audit_trail_str,
     ) = score_dataset(
-        df, meta_df, config=config, has_baseline=has_baseline, return_details=True
+        df, context, config=config, has_baseline=has_baseline, return_details=True
     )
 
     # Step 3: Insights & Anomaly Diagnostics
     thresholds = resolve_thresholds(config.thresholds)
     insights = generate_dataset_insights(
-        meta_df, thresholds, has_baseline=has_baseline, quality_dimensions=dim_scores
+        context, thresholds, has_baseline=has_baseline, quality_dimensions=dim_scores
     )
     anomalies = build_anomalies_dataframe(insights)
 
     # Step 4: Structured Recommendations Engine
-    recs, recs_table = generate_recommendations(meta_df, insights=insights)
+    recs, recs_table = generate_recommendations(context, insights=insights)
 
     critical_count = sum(
         1 for it in insights
@@ -197,10 +201,10 @@ def analyze(
     )
     recommendations_count = len(recs)
 
-    # Step 5: Domain Profiling across 10 Analytical Domains
+    # Step 5: Domain Profiling across Analytical Domains (derived from ProfileContext)
     dataset_profile = build_dataset_profile(
         df,
-        meta_df,
+        context,
         overall_score=overall_score,
         dim_scores=dim_scores,
         critical_count=critical_count,
@@ -209,20 +213,42 @@ def analyze(
         baseline_df=baseline_df,
         dataset_name=dataset_name,
     )
-    column_profile = build_column_profile(df, meta_df, col_scores)
-    statistical_profile = build_statistical_profile(df, meta_df)
-    relationships = build_relationship_profile(df, config=config)
-    temporal_profile = build_temporal_profile(df, meta_df, config=config)
-    drift_profile = build_drift_profile(df, baseline_df, meta_df)
+    column_profile = build_column_profile(context, column_scores=col_scores)
+    statistical_profile = build_statistical_profile(context)
+    relationships = (
+        context.relationships
+        if context.relationships is not None
+        else build_relationship_profile(df, config=config)
+    )
+    temporal_profile = build_temporal_profile(context, config=config)
+    drift_profile = build_drift_profile(context) if has_baseline else None
 
-    # Step 6: Standardized Metrics Table & Health Summary
-    metrics_table = get_table_for_DQ_computation(meta_df, [df], [dataset_name])
-    health_summary = summarize_dataset_health(meta_df)
+    # Step 6: Standardized Metrics Table & Health Summary (from ProfileContext)
+    metrics_table = get_table_for_DQ_computation(context)
+    health_summary = summarize_dataset_health(context)
 
-    # Step 7: Legacy Pipeline Block Compatibility
-    dup_row_info = compute_duplicate_row_metrics(df)
+    # Step 7: Legacy Pipeline Block Compatibility (without eager meta_df materialization)
+    total_rows = context.dataset.total_rows
+    dup_cnt = context.dataset.duplicate_rows_count
+    dup_row_info = {
+        "duplicate_row_count": dup_cnt,
+        "duplicate_row_ratio": float(dup_cnt / total_rows) if total_rows > 0 else 0.0,
+        "unique_row_count": context.dataset.unique_rows_count,
+    }
     key_info = relationships.candidate_keys
-    rel_info = compute_numeric_correlations(df) if level in {AnalysisLevel.STANDARD, AnalysisLevel.DEEP} else {}
+    rel_info = (
+        {
+            "pearson_matrix": relationships.pearson_correlations,
+            "spearman_matrix": relationships.spearman_correlations,
+            "high_correlations": (
+                relationships.high_correlations.to_dict(orient="records")
+                if not relationships.high_correlations.empty
+                else []
+            ),
+        }
+        if level in {AnalysisLevel.STANDARD, AnalysisLevel.DEEP, "standard", "deep"}
+        else {}
+    )
 
     drift_summary = {
         "has_baseline": has_baseline,
@@ -232,26 +258,34 @@ def analyze(
     }
 
     if not has_baseline:
-        base_data = _empty_base_block()
-        base_data.update({
+        single_block = _empty_base_block()
+        single_block.pop("meta_before_cleaning", None)
+        single_block.update({
             "dirty_scores": pd.DataFrame([{"Dataset_name": dataset_name, "DQ_Score": overall_score}]),
-            "meta_before_cleaning": meta_df,
-            "recommendations": cleaning_recommendations(meta_df),
+            "recommendations": cleaning_recommendations(context),
             "summarized_before": health_summary,
             "main_metrics_before": metrics_table,
         })
-        prod_data = {}
+        base_data = _LazyPipelineBlock(
+            single_block,
+            _meta_context=context,
+        )
+        prod_data: Any = {}
     else:
-        prod_data = _empty_base_block()
-        prod_data.update({
+        prod_block = _empty_base_block()
+        prod_block.pop("meta_before_cleaning", None)
+        prod_block.update({
             "dirty_scores": pd.DataFrame([{"Dataset_name": dataset_name, "DQ_Score": overall_score}]),
-            "meta_before_cleaning": meta_df,
-            "recommendations": cleaning_recommendations(meta_df),
+            "recommendations": cleaning_recommendations(context),
             "summarized_before": health_summary,
             "main_metrics_before": metrics_table,
         })
+        prod_data = _LazyPipelineBlock(
+            prod_block,
+            _meta_context=context,
+        )
 
-    # Step 8: Build Comprehensive CleanalytixResult
+    # Step 8: Build Comprehensive CleanalytixResult (metadata lazy via LegacyMetaAdapter)
     result = CleanalytixResult(
         overall_score=overall_score,
         quality_dimensions=dim_scores,
@@ -272,11 +306,16 @@ def analyze(
         insights=insights,
         scoring_audit_trail=scoring_audit_trail_str,
         health_summary=health_summary,
-        metadata=meta_df,
+        metadata=None,
+        context=context,
         drift_summary=drift_summary,
         base_data=base_data,
         prod_data=prod_data,
     )
+    if isinstance(base_data, _LazyPipelineBlock) and base_data._meta_context is context:
+        base_data._owner_result = result
+    if isinstance(prod_data, _LazyPipelineBlock) and prod_data._meta_context is context:
+        prod_data._owner_result = result
     return result
 
 

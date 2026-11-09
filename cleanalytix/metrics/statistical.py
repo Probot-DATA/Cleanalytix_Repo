@@ -2,12 +2,89 @@
 
 Computes central tendency, dispersion (Bessel-corrected sample variance & std),
 shape metrics (Fisher-Pearson excess kurtosis & skewness), quantile spreads,
-and multi-method outlier detection (Z-score, Tukey IQR, Modified Z-score).
+continuous histogram entropy (Freedman-Diaconis / Scott's rule), and
+multi-method outlier detection (Z-score, Tukey IQR, Modified Z-score).
 """
 
+import math
 from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
+
+
+def compute_continuous_entropy(series: pd.Series) -> float:
+    """Compute normalized continuous Shannon entropy in [0.0, 1.0] for a numeric Series.
+
+    Uses equal-width histogram binning over ``[min, max]`` with the Freedman-Diaconis
+    rule (``bin_width = 2 * IQR / N_finite^(1/3)``) and falls back to Scott's rule
+    (``bin_width = 3.49 * std / N_finite^(1/3)``) when ``IQR == 0``. The number of
+    bins ``k`` is clamped to ``[5, 50]`` (with fallback ``k = 10``).
+
+    Preserves exact mathematical parity with the numeric branch of
+    ``generate_meta.py::get_entropy()``.
+
+    Parameters
+    ----------
+    series : pd.Series
+        Numeric or numeric-coercible Series. Never mutated.
+
+    Returns
+    -------
+    float
+        Normalized Shannon entropy ``H / ln(k)`` clamped to ``[0.0, 1.0]``.
+    """
+    try:
+        clean = pd.to_numeric(series, errors="coerce").dropna()
+        clean_arr = clean[~np.isinf(clean)].to_numpy(dtype=float)
+        n = len(clean_arr)
+        if n < 2:
+            return 0.0
+
+        x_min, x_max = float(np.min(clean_arr)), float(np.max(clean_arr))
+        if x_min == x_max:
+            return 0.0
+
+        # Freedman-Diaconis rule
+        max_abs = float(np.max(np.abs(clean_arr)))
+        with np.errstate(over="ignore", invalid="ignore"):
+            q75, q25 = np.percentile(clean_arr, [75, 25])
+            iqr = float(q75 - q25)
+            if iqr > 0 and np.isfinite(iqr):
+                bin_width = 2.0 * iqr / (n ** (1.0 / 3.0))
+            else:
+                # Scott's rule fallback
+                if max_abs > 1e150:
+                    std = float(np.std(clean_arr / max_abs, ddof=1)) * max_abs if n > 1 else 0.0
+                else:
+                    std = float(np.std(clean_arr, ddof=1)) if n > 1 else 0.0
+                if std > 0 and np.isfinite(std):
+                    bin_width = 3.49 * std / (n ** (1.0 / 3.0))
+                else:
+                    return 0.0
+
+        if bin_width <= 0 or not np.isfinite(bin_width):
+            return 0.0
+
+        try:
+            diff = x_max - x_min
+            if not np.isfinite(diff) or diff <= 0:
+                k = 10
+            else:
+                k = int(np.ceil(diff / bin_width))
+                k = max(5, min(k, 50))
+        except Exception:
+            k = 10
+
+        counts, _ = np.histogram(clean_arr, bins=k, range=(x_min, x_max))
+        probs = counts / n
+        probs = probs[probs > 0]
+        if len(probs) <= 1:
+            return 0.0
+        h = -float(np.sum(probs * np.log(probs)))
+        norm_ent = float(h / math.log(k))
+        return min(1.0, max(0.0, norm_ent))
+    except Exception:
+        return 0.0
 
 
 def compute_numeric_statistics(series: pd.Series) -> Dict[str, Any]:
@@ -64,6 +141,7 @@ def compute_numeric_statistics(series: pd.Series) -> Dict[str, Any]:
         "zero_ratio": 0.0,
         "negative_count": 0,
         "negative_ratio": 0.0,
+        "continuous_entropy": 0.0,
     }
 
     if n == 0:
@@ -158,6 +236,8 @@ def compute_numeric_statistics(series: pd.Series) -> Dict[str, Any]:
                     raw_kurt = clean_vals.kurt()  # pandas kurt() computes Fisher's excess kurtosis
                     if pd.notna(raw_kurt):
                         res["kurtosis"] = float(raw_kurt)
+
+        res["continuous_entropy"] = compute_continuous_entropy(series)
 
     return res
 

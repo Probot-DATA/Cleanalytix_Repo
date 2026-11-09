@@ -7,7 +7,8 @@ name = "cleanalytix"
 version = "0.2.0"
 description = "Cleanalytix is a Data Quality Intelligence and Advanced Analytics library for tabular datasets."
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [
     { name = "Probot-DATA contributors" }
@@ -24,7 +25,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -37,8 +37,6 @@ dependencies = [
     "pandas>=1.5.0",
     "numpy>=1.23.0",
     "scipy>=1.10.0",
-    "scikit-learn>=1.1.0",
-    "nltk>=3.8.0",
     "dateparser>=1.2.0",
 ]
 
@@ -56,7 +54,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["cleanalytix*"]
+include = ["cleanalytix", "cleanalytix.*"]
 
 [tool.ruff]
 line-length = 100

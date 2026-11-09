@@ -13,8 +13,15 @@ from cleanalytix.metrics.uniqueness import (
     detect_candidate_keys,
 )
 from cleanalytix.metrics.statistical import (
+    compute_continuous_entropy,
     compute_numeric_statistics,
     detect_outliers,
+)
+from cleanalytix.metrics.validity import (
+    compute_column_validity,
+    compute_rule_validity_metrics,
+    compute_type_validity_metrics,
+    compute_whitespace_metrics,
 )
 from cleanalytix.metrics.distribution import (
     compute_categorical_distribution,
@@ -38,8 +45,13 @@ __all__ = [
     "compute_column_uniqueness",
     "compute_duplicate_row_metrics",
     "detect_candidate_keys",
+    "compute_continuous_entropy",
     "compute_numeric_statistics",
     "detect_outliers",
+    "compute_column_validity",
+    "compute_rule_validity_metrics",
+    "compute_type_validity_metrics",
+    "compute_whitespace_metrics",
     "compute_categorical_distribution",
     "compute_numeric_drift",
     "compute_categorical_drift",
