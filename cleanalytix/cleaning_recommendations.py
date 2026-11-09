@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union, Sequence
 import pandas as pd
 import numpy as np
 
@@ -9,10 +9,98 @@ from cleanalytix.types import (
     RecommendationItem,
     InsightItem,
     InsightSeverity,
+    ProfileContext,
 )
 
 
-def cleaning_recommendations(meta_data_combined: pd.DataFrame) -> pd.DataFrame:
+def _profile_context_to_rec_rows(
+    ctx_or_list: Union[ProfileContext, Sequence[ProfileContext]]
+) -> List[Dict[str, Any]]:
+    """Extract per-column recommendation attributes directly from ProfileContext objects."""
+    contexts = [ctx_or_list] if isinstance(ctx_or_list, ProfileContext) else list(ctx_or_list)
+    rows: List[Dict[str, Any]] = []
+    for ctx in contexts:
+        dataset_name = ctx.dataset.dataset_name
+        for col in ctx.column_profiles:
+            role = str(col.role)
+            dtype_obj = col.dtype_object if col.dtype_object is not None else col.dtype
+            comp = col.completeness
+            uniq = col.uniqueness
+            val = col.validity
+            stat = col.statistical
+            dist = col.distribution
+            temp = col.temporal
+
+            non_null_count = int(comp.non_null_count) if comp is not None else 0
+            missing_count = int(comp.null_count) if comp is not None else 0
+            missing_percent = float(comp.null_percentage) if comp is not None else 0.0
+            unique_count = int(uniq.distinct_count) if uniq is not None else 0
+            type_errors = int(val.type_error_count) if val is not None else 0
+            rule_errors = int(val.rule_error_count) if val is not None else 0
+
+            is_num_branch = (
+                role in {"continuous", "discrete"}
+                and stat is not None
+                and pd.api.types.is_numeric_dtype(dtype_obj)
+                and not pd.api.types.is_bool_dtype(dtype_obj)
+            )
+            is_dt_branch = (
+                role == "datetime"
+                or pd.api.types.is_datetime64_any_dtype(dtype_obj)
+            )
+
+            skewness_level = None
+            outliers_val = None
+            rare_category_percent = None
+            whitespace_issues = None
+            date_range_days = None
+
+            if is_num_branch:
+                if non_null_count > 0 and stat is not None:
+                    if stat.skewness is not None:
+                        abs_s = abs(stat.skewness)
+                        skewness_level = (
+                            "low" if abs_s < 0.5 else ("moderate" if abs_s < 1.0 else "high")
+                        )
+                    outliers_val = int(stat.outlier_count)
+            elif role in {"binary", "identifier"}:
+                outliers_val = 0
+                rare_category_percent = (
+                    float(dist.rare_categories_percentage) if dist is not None else 0.0
+                )
+                whitespace_issues = int(val.whitespace_count) if val is not None else 0
+            elif is_dt_branch:
+                if temp is not None:
+                    date_range_days = temp.date_range_days
+            else:
+                rare_category_percent = (
+                    float(dist.rare_categories_percentage) if dist is not None else 0.0
+                )
+                whitespace_issues = int(val.whitespace_count) if val is not None else 0
+
+            rows.append({
+                "dataset_name": dataset_name,
+                "column_name": col.name,
+                "column_role": role,
+                "dtype": dtype_obj,
+                "non_null_count": non_null_count,
+                "missing_count": missing_count,
+                "missing_percent": missing_percent,
+                "unique_count": unique_count,
+                "skewness_level": skewness_level,
+                "outlier_count": outliers_val,
+                "rare_category_percent": rare_category_percent,
+                "whitespace_issues": whitespace_issues,
+                "date_range_days": date_range_days,
+                "type_errors": type_errors,
+                "rule_errors": rule_errors,
+            })
+    return rows
+
+
+def cleaning_recommendations(
+    meta_data_combined: Union[ProfileContext, Sequence[ProfileContext], pd.DataFrame]
+) -> pd.DataFrame:
     """Convert metadata rows into cleaning recommendations.
 
     Parameters
@@ -79,7 +167,12 @@ def cleaning_recommendations(meta_data_combined: pd.DataFrame) -> pd.DataFrame:
 
     def infer_type(row):
         # Prefer explicit column role when available
-        if "column_role" in row.index and pd.notna(row.get("column_role")):
+        has_role = (
+            ("column_role" in row and pd.notna(row.get("column_role")))
+            if isinstance(row, dict)
+            else ("column_role" in row.index and pd.notna(row.get("column_role")))
+        )
+        if has_role:
             role = str(row["column_role"]).lower()
             if role == "continuous":
                 return "numeric"
@@ -146,7 +239,14 @@ def cleaning_recommendations(meta_data_combined: pd.DataFrame) -> pd.DataFrame:
         10: "No Issues Detected"
     }
 
-    for i, row in meta_data_combined.iterrows():
+    if isinstance(meta_data_combined, ProfileContext) or (
+        isinstance(meta_data_combined, Sequence) and not isinstance(meta_data_combined, pd.DataFrame)
+    ):
+        row_iter = _profile_context_to_rec_rows(meta_data_combined)
+    else:
+        row_iter = [row for _, row in meta_data_combined.iterrows()]
+
+    for row in row_iter:
         suggestions = []
         col_type = infer_type(row)
 
@@ -223,15 +323,15 @@ def normalize_severity(severity: Any) -> str:
 
 
 def generate_recommendations(
-    meta_df: pd.DataFrame,
+    meta_df: Optional[Union[ProfileContext, Sequence[ProfileContext], pd.DataFrame]],
     insights: Optional[List[InsightItem]] = None,
 ) -> Tuple[List[RecommendationItem], pd.DataFrame]:
     """Generate structured, actionable recommendations across all detected DQ issues.
 
     Parameters
     ----------
-    meta_df : pd.DataFrame
-        Profiling metadata from generate_meta.
+    meta_df : ProfileContext or pd.DataFrame
+        ``ProfileContext`` (v2.0 native) or profiling metadata from ``generate_meta()``.
     insights : list of InsightItem, optional
         Pre-computed dataset and column insights.
 
@@ -242,13 +342,23 @@ def generate_recommendations(
     """
     raw_items: List[Dict[str, Any]] = []
 
+    is_context_input = isinstance(meta_df, ProfileContext) or (
+        isinstance(meta_df, Sequence) and not isinstance(meta_df, pd.DataFrame)
+    )
+    if is_context_input:
+        col_rec_rows = _profile_context_to_rec_rows(meta_df)  # type: ignore[arg-type]
+        has_meta_rows = len(col_rec_rows) > 0
+    else:
+        has_meta_rows = meta_df is not None and not meta_df.empty
+        col_rec_rows = [row for _, row in meta_df.iterrows()] if has_meta_rows else []  # type: ignore[union-attr]
+
     # 1. Dataset-level and multidimensional items from insights
     if insights:
         for ins in insights:
             sev_str = normalize_severity(ins.severity)
             if sev_str in {"CRITICAL", "WARNING"}:
                 # Avoid duplicating column-level completeness/validity recommendations already generated from meta_df
-                if meta_df is not None and not meta_df.empty:
+                if has_meta_rows:
                     if ins.dimension in {QualityDimension.COMPLETENESS, QualityDimension.VALIDITY} and ins.column is not None:
                         continue
 
@@ -272,9 +382,9 @@ def generate_recommendations(
                     "details": ins.details or {"metric_name": ins.metric_name, "metric_value": ins.metric_value, "threshold": ins.threshold},
                 })
 
-    # 2. Column-level items from meta_df
-    if meta_df is not None and not meta_df.empty:
-        for _, row in meta_df.iterrows():
+    # 2. Column-level items from meta_df / ProfileContext
+    if has_meta_rows:
+        for row in col_rec_rows:
             col = str(row.get("column_name", ""))
             role = str(row.get("column_role", "")).lower()
             dtype = str(row.get("dtype", "")).lower()
@@ -477,4 +587,7 @@ def generate_recommendations(
         table_df = pd.DataFrame(table_rows)
 
     return items, table_df
+
+
+generate_cleaning_recommendations_v2 = generate_recommendations
 

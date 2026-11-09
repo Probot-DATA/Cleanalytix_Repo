@@ -202,13 +202,20 @@ def build_profile_context(
         active_rules.update(rules)
 
     time_cfg = cfg.timeliness_config
+    cfg_dt_cols: set = set()
     if time_cfg:
         if isinstance(time_cfg, dict):
             ref_time = time_cfg.get("reference_time")
-            fresh_thresh = float(time_cfg.get("freshness_days", 30.0))
+            fd = time_cfg.get("freshness_days", 30.0)
+            fresh_thresh = float(fd) if fd is not None else 30.0
+            dt_list = time_cfg.get("datetime_columns")
         else:
             ref_time = getattr(time_cfg, "reference_time", None)
-            fresh_thresh = float(getattr(time_cfg, "freshness_days", 30.0))
+            fd = getattr(time_cfg, "freshness_days", 30.0)
+            fresh_thresh = float(fd) if fd is not None else 30.0
+            dt_list = getattr(time_cfg, "datetime_columns", None)
+        if dt_list:
+            cfg_dt_cols = {str(c) for c in dt_list} | set(dt_list)
     else:
         ref_time = None
         fresh_thresh = 30.0
@@ -465,11 +472,42 @@ def build_profile_context(
                 top_frequencies=dict(cat_dist["top_frequencies"]),
             )
 
+        # Optional reference profile adjustment (learned baseline bounds/categories)
+        if isinstance(reference_profile, dict) and role not in {"binary", "identifier"}:
+            ref_ds = reference_profile.get(dataset_name, {})
+            if isinstance(ref_ds, dict):
+                ref_col = ref_ds.get(col_raw) or ref_ds.get(col_name)
+                if isinstance(ref_col, dict) and non_null_count > 0:
+                    if ref_col.get("type") == "numeric" and col_statistical is not None:
+                        lb = ref_col.get("lower", np.nan)
+                        ub = ref_col.get("upper", np.nan)
+                        if pd.notna(lb) and pd.notna(ub):
+                            s_clean = ser.dropna()
+                            outliers = int(((s_clean < lb) | (s_clean > ub)).sum())
+                            out_pct = float((outliers / non_null_count) * 100.0)
+                            out_ratio = float(outliers / non_null_count)
+                            col_statistical.outlier_count = outliers
+                            col_statistical.outlier_percentage = out_pct
+                            col_statistical.outlier_ratio = out_ratio
+                            col_statistical.outlier_lower_bound = float(lb)
+                            col_statistical.outlier_upper_bound = float(ub)
+                    elif ref_col.get("type") == "categorical" and col_distribution is not None:
+                        popular = ref_col.get("popular", [])
+                        if len(popular) > 0:
+                            vals = ser.dropna().astype(str)
+                            rare_pct_ref = float((~vals.isin(popular)).mean() * 100.0)
+                            col_distribution.rare_categories_percentage = rare_pct_ref
+                            col_distribution.rare_categories_ratio = float(
+                                rare_pct_ref / 100.0
+                            )
+
         # 6. Temporal Domain
         is_dt_col = (
             role == "datetime"
             or "datetime" in dtype_str.lower()
             or is_datetime64_any_dtype(ser)
+            or col_raw in cfg_dt_cols
+            or col_name in cfg_dt_cols
         )
         col_temporal: Optional[ColumnTemporal] = None
         if is_dt_col:
@@ -516,6 +554,7 @@ def build_profile_context(
                 inferred_cadence=cadence_str,
                 freshness_status=fresh_status_str,
             )
+            col_temporal._reference_time = ref_time  # type: ignore[attr-defined]
 
         # 7. Drift Domain
         col_drift: Optional[ColumnDrift] = None
@@ -569,6 +608,14 @@ def build_profile_context(
                         sample_size_base=int(c_res["sample_size_base"]),
                         sample_size_prod=int(c_res["sample_size_prod"]),
                     )
+                    if (
+                        is_numeric_dtype(b_ser)
+                        and is_numeric_dtype(ser)
+                        and not is_bool_dtype(b_ser)
+                        and not is_bool_dtype(ser)
+                        and role not in {"categorical", "binary", "datetime", "boolean"}
+                    ):
+                        col_drift._numeric_drift_override = compute_numeric_drift(b_ser, ser)  # type: ignore[attr-defined]
             else:
                 col_drift = ColumnDrift(
                     psi=1.0,
@@ -1417,13 +1464,20 @@ def build_temporal_profile(
     assert isinstance(meta_df, pd.DataFrame)
     cfg = config or CleanalytixConfig()
     time_cfg = cfg.timeliness_config
+    cfg_dt_cols: set = set()
     if time_cfg:
         if isinstance(time_cfg, dict):
             ref_time = time_cfg.get("reference_time")
-            fresh_thresh = float(time_cfg.get("freshness_days", 30.0))
+            fd = time_cfg.get("freshness_days", 30.0)
+            fresh_thresh = float(fd) if fd is not None else 30.0
+            dt_list = time_cfg.get("datetime_columns")
         else:
             ref_time = getattr(time_cfg, "reference_time", None)
-            fresh_thresh = float(getattr(time_cfg, "freshness_days", 30.0))
+            fd = getattr(time_cfg, "freshness_days", 30.0)
+            fresh_thresh = float(fd) if fd is not None else 30.0
+            dt_list = getattr(time_cfg, "datetime_columns", None)
+        if dt_list:
+            cfg_dt_cols = {str(c) for c in dt_list} | set(dt_list)
     else:
         ref_time = None
         fresh_thresh = 30.0
@@ -1509,7 +1563,29 @@ def build_drift_profile(
             if d is None:
                 continue
             role = str(col_prof.role)
-            if d.ks_statistic is not None:
+            num_override = getattr(d, "_numeric_drift_override", None)
+            if isinstance(num_override, dict):
+                rows.append({
+                    "column_name": col_prof.name,
+                    "column_role": role,
+                    "sample_size_base": num_override["sample_size_base"],
+                    "sample_size_prod": num_override["sample_size_prod"],
+                    "ks_statistic": round(num_override["ks_statistic"], 4),
+                    "ks_p_value": round(num_override["ks_p_value"], 6),
+                    "wasserstein_distance": round(num_override["wasserstein_distance"], 4),
+                    "normalized_wasserstein": round(num_override["normalized_wasserstein"], 4),
+                    "psi": round(num_override["psi"], 4),
+                    "js_divergence": round(num_override["js_divergence"], 4),
+                    "kl_divergence": round(num_override["kl_divergence"], 4),
+                    "reverse_kl_divergence": round(num_override["reverse_kl_divergence"], 4),
+                    "unseen_categories_count": 0,
+                    "unseen_categories_ratio": 0.0,
+                    "unseen_categories": [],
+                    "unseen_categories_list": [],
+                    "drift_detected": num_override["drift_detected"],
+                    "drift_severity": str(num_override["drift_severity"]).upper(),
+                })
+            elif d.ks_statistic is not None:
                 rows.append({
                     "column_name": col_prof.name,
                     "column_role": role,

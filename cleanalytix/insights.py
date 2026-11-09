@@ -4,7 +4,7 @@ Generates structured, advisory data quality insights and recommendations across
 the 6 quality dimensions without any destructive data modification.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import pandas as pd
 import numpy as np
 
@@ -13,12 +13,14 @@ from cleanalytix.types import (
     InsightSeverity,
     QualityDimension,
     DimensionScore,
+    ProfileContext,
 )
+from cleanalytix.scoring import resolve_thresholds
 
 
 def generate_dataset_insights(
-    meta_df: pd.DataFrame,
-    thresholds: Dict[str, float],
+    meta_df: Union[ProfileContext, pd.DataFrame],
+    thresholds: Optional[Dict[str, float]] = None,
     has_baseline: bool = False,
     drift_summary: Optional[Dict[str, Any]] = None,
     quality_dimensions: Optional[Dict[str, DimensionScore]] = None,
@@ -27,10 +29,10 @@ def generate_dataset_insights(
 
     Parameters
     ----------
-    meta_df : pd.DataFrame
-        Column metadata table containing profiling statistics.
-    thresholds : dict
-        Configured quality thresholds.
+    meta_df : ProfileContext or pd.DataFrame
+        ``ProfileContext`` (v2.0 native) or legacy column metadata table.
+    thresholds : dict, optional
+        Configured quality thresholds. Defaults to standard thresholds if omitted.
     has_baseline : bool, default False
         Whether baseline drift comparison was conducted.
     drift_summary : dict, optional
@@ -44,13 +46,26 @@ def generate_dataset_insights(
         Deterministic, structured list of insights sorted by severity.
     """
     insights: List[InsightItem] = []
+    if thresholds is None:
+        thresholds = resolve_thresholds(None)
 
-    if meta_df.empty:
-        return insights
+    is_context = isinstance(meta_df, ProfileContext)
+    if is_context:
+        if len(meta_df.columns) == 0:
+            return insights
+    else:
+        if meta_df.empty:
+            return insights
 
     # 1. Dataset-level Uniqueness / Duplication check
     dup_percent = 0.0
-    if "duplicate_rows_percent" in meta_df.columns:
+    if is_context:
+        total_rows = meta_df.dataset.total_rows
+        if total_rows > 0:
+            dup_percent = float((meta_df.dataset.duplicate_rows_count / total_rows) * 100.0)
+        else:
+            dup_percent = float(meta_df.dataset.duplicate_rows_percent)
+    elif "duplicate_rows_percent" in meta_df.columns:
         first_dup = meta_df["duplicate_rows_percent"].iloc[0]
         if pd.notna(first_dup):
             dup_percent = float(first_dup)
@@ -169,7 +184,58 @@ def generate_dataset_insights(
                     )
 
     # 2. Column-level evaluations
-    for _, row in meta_df.iterrows():
+    col_records: List[Dict[str, Any]] = []
+    if is_context:
+        for cp in meta_df.column_profiles:
+            role_str = str(cp.role)
+            dtype_obj = cp.dtype_object
+            is_num_branch = (
+                role_str in {"continuous", "discrete"}
+                and cp.statistical is not None
+                and dtype_obj is not None
+                and pd.api.types.is_numeric_dtype(dtype_obj)
+                and not pd.api.types.is_bool_dtype(dtype_obj)
+            )
+            is_dt_branch = (
+                role_str == "datetime"
+                or (dtype_obj is not None and pd.api.types.is_datetime64_any_dtype(dtype_obj))
+            )
+            ws_val: Optional[int]
+            if is_num_branch or is_dt_branch:
+                ws_val = None
+            else:
+                ws_val = int(cp.validity.whitespace_count) if cp.validity else 0
+
+            col_records.append({
+                "column_name": str(cp.name),
+                "column_role": role_str,
+                "non_null_count": int(cp.completeness.non_null_count) if cp.completeness else 0,
+                "missing_percent": float(cp.completeness.null_percentage) if cp.completeness else 0.0,
+                "type_errors": int(cp.validity.type_error_count) if cp.validity else 0,
+                "whitespace_issues": ws_val,
+                "rule_errors": int(cp.validity.rule_error_count) if cp.validity else 0,
+                "outlier_count": (
+                    int(cp.statistical.outlier_count)
+                    if (cp.statistical is not None and role_str in {"continuous", "discrete"})
+                    else 0
+                ),
+                "psi_divergence": cp.drift.psi if cp.drift is not None else None,
+            })
+    else:
+        for _, row in meta_df.iterrows():
+            col_records.append({
+                "column_name": str(row.get("column_name", "")),
+                "column_role": str(row.get("column_role", "")),
+                "non_null_count": row.get("non_null_count", 0),
+                "missing_percent": row.get("missing_percent", 0.0),
+                "type_errors": row.get("type_errors", 0),
+                "whitespace_issues": row.get("whitespace_issues", 0),
+                "rule_errors": row.get("rule_errors", 0),
+                "outlier_count": row.get("outlier_count", 0),
+                "psi_divergence": row.get("psi_divergence", 0.0),
+            })
+
+    for row in col_records:
         col = str(row.get("column_name", ""))
         role = str(row.get("column_role", ""))
 
@@ -334,6 +400,9 @@ def generate_dataset_insights(
     insights.sort(key=lambda item: severity_order.get(item.severity, 99))
 
     return insights
+
+
+generate_insights = generate_dataset_insights
 
 
 def build_anomalies_dataframe(insights: List[InsightItem]) -> pd.DataFrame:

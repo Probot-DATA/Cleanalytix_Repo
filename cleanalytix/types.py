@@ -776,6 +776,53 @@ class PipelineBlock(TypedDict, total=False):
     main_metrics_after: pd.DataFrame
 
 
+class _LazyPipelineBlock(dict):
+    """PipelineBlock dictionary that lazily materializes ``meta_before_cleaning``."""
+
+    def __init__(
+        self,
+        *args: Any,
+        _meta_context: Optional[ProfileContext] = None,
+        _owner_result: Optional[CleanalytixResult] = None,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self._meta_context = _meta_context
+        self._owner_result = _owner_result
+        self._lazy_meta_pending = (
+            _meta_context is not None and self.get("meta_before_cleaning") is None
+        )
+        if self._lazy_meta_pending:
+            super().__setitem__("meta_before_cleaning", None)
+
+    def _materialize_meta(self) -> pd.DataFrame:
+        if self._lazy_meta_pending and self._meta_context is not None:
+            if (
+                self._owner_result is not None
+                and self._owner_result._context is self._meta_context
+            ):
+                meta_df = self._owner_result._materialize_lazy_metadata()
+            else:
+                from cleanalytix.legacy.adapter import LegacyMetaAdapter
+
+                meta_df = LegacyMetaAdapter.context_to_meta_df(self._meta_context)
+            super().__setitem__("meta_before_cleaning", meta_df)
+            self._lazy_meta_pending = False
+            return meta_df
+        val = super().get("meta_before_cleaning")
+        return val if isinstance(val, pd.DataFrame) else pd.DataFrame()
+
+    def __getitem__(self, key: Any) -> Any:
+        if key == "meta_before_cleaning" and getattr(self, "_lazy_meta_pending", False):
+            return self._materialize_meta()
+        return super().__getitem__(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key == "meta_before_cleaning" and getattr(self, "_lazy_meta_pending", False):
+            return self._materialize_meta()
+        return super().get(key, default)
+
+
 class CleanalytixResult(dict):
     """Comprehensive Data Quality Intelligence and Advanced Analytics result object.
 
@@ -881,21 +928,25 @@ class CleanalytixResult(dict):
             if recs_df.empty and self["recommendations"]:
                 recs_df = pd.DataFrame([r.to_dict() for r in self["recommendations"]])
 
-            self["base_data"] = {
-                "dirty_scores": pd.DataFrame([{"Dataset_name": "dataset", "DQ_Score": overall_score}]),
-                "meta_before_cleaning": super().get("metadata", pd.DataFrame()),
-                "recommendations": recs_df,
-                "insights": self["insights"],
-                "quality_dimensions": self["quality_dimensions"],
-                "cleaned_scores": pd.DataFrame(),
-                "cleaned_datasets": [],
-                "meta_after_cleaning": pd.DataFrame(),
-                "change_log": pd.DataFrame(),
-                "summarized_before": self["health_summary"],
-                "summarized_after": pd.DataFrame(),
-                "main_metrics_before": self["metrics_table"],
-                "main_metrics_after": pd.DataFrame(),
-            }
+            self["base_data"] = _LazyPipelineBlock(
+                {
+                    "dirty_scores": pd.DataFrame([{"Dataset_name": "dataset", "DQ_Score": overall_score}]),
+                    "meta_before_cleaning": super().get("metadata"),
+                    "recommendations": recs_df,
+                    "insights": self["insights"],
+                    "quality_dimensions": self["quality_dimensions"],
+                    "cleaned_scores": pd.DataFrame(),
+                    "cleaned_datasets": [],
+                    "meta_after_cleaning": pd.DataFrame(),
+                    "change_log": pd.DataFrame(),
+                    "summarized_before": self["health_summary"],
+                    "summarized_after": pd.DataFrame(),
+                    "main_metrics_before": self["metrics_table"],
+                    "main_metrics_after": pd.DataFrame(),
+                },
+                _meta_context=context if metadata is None else None,
+                _owner_result=self,
+            )
 
         self["prod_data"] = prod_data or {}
 
@@ -911,7 +962,10 @@ class CleanalytixResult(dict):
             super().__setitem__("metadata", meta_df)
             self._lazy_metadata_pending = False
             base_block = super().get("base_data")
-            if isinstance(base_block, dict) and base_block.get("meta_before_cleaning", pd.DataFrame()).empty:
+            if isinstance(base_block, _LazyPipelineBlock) and base_block._meta_context is self._context:
+                dict.__setitem__(base_block, "meta_before_cleaning", meta_df)
+                base_block._lazy_meta_pending = False
+            elif isinstance(base_block, dict) and dict.get(base_block, "meta_before_cleaning") is None:
                 base_block["meta_before_cleaning"] = meta_df
             return meta_df
         return super().__getitem__("metadata")
@@ -920,6 +974,11 @@ class CleanalytixResult(dict):
         if key == "metadata" and getattr(self, "_lazy_metadata_pending", False):
             return self._materialize_lazy_metadata()
         return super().__getitem__(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key == "metadata" and getattr(self, "_lazy_metadata_pending", False):
+            return self._materialize_lazy_metadata()
+        return super().get(key, default)
 
     @property
     def context(self) -> Optional[ProfileContext]:
